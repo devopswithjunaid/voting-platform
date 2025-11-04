@@ -1,0 +1,37 @@
+---
+# Worker (.NET) Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app: worker
+    tier: data-processing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+        tier: data-processing
+    spec:
+      nodeSelector:
+        nodegroup: secure-dev-env-app-nodes
+      containers:
+      - name: worker
+        image: 356564030462.dkr.ecr.us-west-2.amazonaws.com/my-voting-app:worker-latest
+        env:
+        - name: REDIS_HOST
+          value: redis
+        - name: DATABASE_URL
+          value: Server=db;Username=postgres;Password=postgres;
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
