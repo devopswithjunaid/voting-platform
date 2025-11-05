@@ -22,7 +22,7 @@ spec:
         nodegroup: secure-dev-env-app-nodes
       containers:
       - name: backend
-        image: 356564030462.dkr.ecr.us-west-2.amazonaws.com/my-voting-app:backend-latest
+        image: 767225687948.dkr.ecr.us-west-2.amazonaws.com/my-voting-app:backend-latest
         ports:
         - containerPort: 4000
         env:
