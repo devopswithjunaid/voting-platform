@@ -5,6 +5,7 @@ pipeline {
         AWS_DEFAULT_REGION = 'us-west-2'
         ECR_REGISTRY = '767225687948.dkr.ecr.us-west-2.amazonaws.com'
         EKS_CLUSTER_NAME = 'secure-dev-env-cluster'
+        PATH = "/tmp/aws-cli:/tmp:$PATH"
     }
     
     stages {
@@ -23,7 +24,6 @@ pipeline {
                             curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
                             unzip awscliv2.zip
                             ./aws/install --bin-dir /tmp/aws-cli --install-dir /tmp/aws-cli
-                            export PATH="/tmp/aws-cli:$PATH"
                             rm -rf awscliv2.zip aws/
                         fi
                         
@@ -32,13 +32,12 @@ pipeline {
                             curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
                             chmod +x kubectl
                             mv kubectl /tmp/kubectl
-                            export PATH="/tmp:$PATH"
                         fi
                         
                         echo "🔧 Tools Check:"
-                        docker --version || echo "Docker: Using host Docker socket"
-                        /tmp/aws-cli/aws --version || echo "AWS CLI: Installing..."
-                        /tmp/kubectl version --client || echo "kubectl: Installing..."
+                        docker --version || echo "❌ Docker not available - check Jenkins setup"
+                        /tmp/aws-cli/aws --version || echo "❌ AWS CLI failed"
+                        /tmp/kubectl version --client || echo "❌ kubectl failed"
                         
                         echo "✅ Setup completed"
                     '''
@@ -91,8 +90,6 @@ pipeline {
             steps {
                 withCredentials([aws(credentialsId: 'aws-credentials')]) {
                     sh '''
-                        export PATH="/tmp/aws-cli:$PATH"
-                        
                         # ECR Login
                         /tmp/aws-cli/aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
                         
@@ -113,8 +110,6 @@ pipeline {
             steps {
                 withCredentials([aws(credentialsId: 'aws-credentials')]) {
                     sh '''
-                        export PATH="/tmp/aws-cli:/tmp:$PATH"
-                        
                         # Update kubeconfig
                         /tmp/aws-cli/aws eks update-kubeconfig --region ${AWS_DEFAULT_REGION} --name ${EKS_CLUSTER_NAME}
                         
@@ -136,7 +131,6 @@ pipeline {
         stage('📊 Verify') {
             steps {
                 sh '''
-                    export PATH="/tmp:$PATH"
                     /tmp/kubectl get pods
                     /tmp/kubectl get svc
                 '''
@@ -147,6 +141,9 @@ pipeline {
     post {
         always {
             sh 'docker system prune -f || true'
+        }
+        failure {
+            echo "❌ Pipeline failed! Check Docker access in Jenkins container."
         }
     }
 }
