@@ -77,19 +77,34 @@ pipeline {
                     try {
                         echo "=== STAGE 3: TOOL VERIFICATION ==="
                         sh '''
-                            echo "🔧 Installing Docker in Jenkins container..."
+                            echo "🔍 Checking Docker availability..."
                             
-                            # Install Docker
-                            if ! command -v docker &> /dev/null; then
-                                echo "Installing Docker..."
-                                apt-get update
-                                apt-get install -y docker.io
-                                systemctl start docker || service docker start || echo "Docker service start attempted"
-                                usermod -aG docker jenkins || echo "User modification attempted"
+                            # Check if Docker socket is available
+                            if [ -S /var/run/docker.sock ]; then
+                                echo "✅ Docker socket found"
+                                
+                                # Try to install Docker CLI if not present
+                                if ! command -v docker &> /dev/null; then
+                                    echo "Installing Docker CLI..."
+                                    
+                                    # Try different installation methods
+                                    curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh || {
+                                        echo "Docker installation failed, trying alternative..."
+                                        
+                                        # Alternative: Download Docker binary
+                                        curl -L "https://download.docker.com/linux/static/stable/x86_64/docker-20.10.9.tgz" | tar -xz
+                                        cp docker/docker /usr/local/bin/ || cp docker/docker ~/docker
+                                        export PATH=$PATH:~/
+                                    }
+                                fi
+                                
+                                # Test Docker
+                                docker --version || echo "Docker CLI installed but may need restart"
+                                
+                            else
+                                echo "⚠️ Docker socket not available - using host Docker"
+                                echo "Pipeline will continue with available tools"
                             fi
-                            
-                            echo "🔍 Checking Docker:"
-                            docker --version || echo "Docker installation in progress..."
                             
                             echo "🔍 Checking AWS CLI:"
                             if command -v aws &> /dev/null; then
@@ -99,7 +114,7 @@ pipeline {
                                 echo "⚠️ AWS CLI: Installing..."
                                 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
                                 unzip -q awscliv2.zip
-                                ./aws/install
+                                ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli
                                 rm -rf aws awscliv2.zip
                                 aws --version
                                 echo "✅ AWS CLI: Installed"
@@ -113,7 +128,8 @@ pipeline {
                                 echo "⚠️ kubectl: Installing..."
                                 curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
                                 chmod +x kubectl
-                                mv kubectl /usr/local/bin/
+                                mv kubectl /usr/local/bin/ || mv kubectl ~/kubectl
+                                export PATH=$PATH:~/
                                 kubectl version --client
                                 echo "✅ kubectl: Installed"
                             fi
