@@ -1,0 +1,202 @@
+pipeline {
+    agent {
+        kubernetes {
+            yamlFile 'jenkins-dind-pod-template.yaml'
+        }
+    }
+    
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        ECR_REGISTRY = '123456789012.dkr.ecr.us-east-1.amazonaws.com'
+        EKS_CLUSTER_NAME = 'your-eks-cluster'
+        BUILD_NUMBER = "${env.BUILD_NUMBER}"
+    }
+    
+    stages {
+        stage('🔍 Environment Setup') {
+            steps {
+                container('jenkins-agent') {
+                    script {
+                        echo "=== STAGE 1: ENVIRONMENT SETUP ==="
+                        sh '''
+                            echo "📋 System Information:"
+                            whoami
+                            pwd
+                            echo "Build: ${BUILD_NUMBER}"
+                            
+                            echo "🔧 Tool Verification:"
+                            docker --version
+                            aws --version
+                            kubectl version --client
+                            
+                            echo "✅ Stage 1 completed successfully"
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('📥 Code Checkout') {
+            steps {
+                container('jenkins-agent') {
+                    script {
+                        echo "=== STAGE 2: CODE CHECKOUT ==="
+                        checkout scm
+                        sh '''
+                            echo "📂 Repository Information:"
+                            git remote -v
+                            git log --oneline -3
+                            
+                            echo "📁 Project Structure:"
+                            ls -la
+                            find . -name "Dockerfile" -type f
+                            
+                            echo "✅ Stage 2 completed successfully"
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('🏗️ Build Images') {
+            parallel {
+                stage('Build Frontend') {
+                    steps {
+                        container('jenkins-agent') {
+                            script {
+                                sh '''
+                                    echo "🏗️ Building Frontend..."
+                                    cd frontend
+                                    docker build -t voting-app:frontend-${BUILD_NUMBER} .
+                                    echo "✅ Frontend build completed"
+                                '''
+                            }
+                        }
+                    }
+                }
+                stage('Build Backend') {
+                    steps {
+                        container('jenkins-agent') {
+                            script {
+                                sh '''
+                                    echo "🏗️ Building Backend..."
+                                    cd backend
+                                    docker build -t voting-app:backend-${BUILD_NUMBER} .
+                                    echo "✅ Backend build completed"
+                                '''
+                            }
+                        }
+                    }
+                }
+                stage('Build Worker') {
+                    steps {
+                        container('jenkins-agent') {
+                            script {
+                                sh '''
+                                    echo "🏗️ Building Worker..."
+                                    cd worker
+                                    docker build -t voting-app:worker-${BUILD_NUMBER} .
+                                    echo "✅ Worker build completed"
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('📤 Push to ECR') {
+            steps {
+                container('jenkins-agent') {
+                    script {
+                        withCredentials([aws(credentialsId: 'aws-credentials', region: 'us-east-1')]) {
+                            sh '''
+                                echo "📤 Pushing to ECR..."
+                                
+                                # Login to ECR
+                                aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                                
+                                # Tag and push images
+                                docker tag voting-app:frontend-${BUILD_NUMBER} ${ECR_REGISTRY}/voting-app:frontend-${BUILD_NUMBER}
+                                docker tag voting-app:backend-${BUILD_NUMBER} ${ECR_REGISTRY}/voting-app:backend-${BUILD_NUMBER}
+                                docker tag voting-app:worker-${BUILD_NUMBER} ${ECR_REGISTRY}/voting-app:worker-${BUILD_NUMBER}
+                                
+                                docker push ${ECR_REGISTRY}/voting-app:frontend-${BUILD_NUMBER}
+                                docker push ${ECR_REGISTRY}/voting-app:backend-${BUILD_NUMBER}
+                                docker push ${ECR_REGISTRY}/voting-app:worker-${BUILD_NUMBER}
+                                
+                                echo "✅ All images pushed to ECR"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('🚀 Deploy to EKS') {
+            steps {
+                container('jenkins-agent') {
+                    script {
+                        withCredentials([aws(credentialsId: 'aws-credentials', region: 'us-east-1')]) {
+                            sh '''
+                                echo "🚀 Deploying to EKS..."
+                                
+                                # Update kubeconfig
+                                aws eks update-kubeconfig --region ${AWS_DEFAULT_REGION} --name ${EKS_CLUSTER_NAME}
+                                
+                                # Update image tags in k8s manifests
+                                sed -i "s|image: .*frontend.*|image: ${ECR_REGISTRY}/voting-app:frontend-${BUILD_NUMBER}|g" k8s/frontend.yaml
+                                sed -i "s|image: .*backend.*|image: ${ECR_REGISTRY}/voting-app:backend-${BUILD_NUMBER}|g" k8s/backend.yaml
+                                sed -i "s|image: .*worker.*|image: ${ECR_REGISTRY}/voting-app:worker-${BUILD_NUMBER}|g" k8s/worker.yaml
+                                
+                                # Apply manifests
+                                kubectl apply -f k8s/
+                                
+                                # Wait for deployment
+                                kubectl rollout status deployment/frontend
+                                kubectl rollout status deployment/backend
+                                kubectl rollout status deployment/worker
+                                
+                                echo "✅ Deployment completed"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('📊 Verification') {
+            steps {
+                container('jenkins-agent') {
+                    script {
+                        sh '''
+                            echo "📊 Verifying deployment..."
+                            kubectl get pods
+                            kubectl get services
+                            echo "✅ Verification completed"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            container('jenkins-agent') {
+                script {
+                    sh '''
+                        echo "🧹 Cleaning up..."
+                        docker system prune -f || true
+                    '''
+                }
+            }
+        }
+        success {
+            echo "✅ Pipeline completed successfully!"
+        }
+        failure {
+            echo "❌ Pipeline failed!"
+        }
+    }
+}
