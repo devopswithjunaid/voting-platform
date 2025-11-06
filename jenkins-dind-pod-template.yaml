@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: dind
+    image: devopswithjunaid/jenkins-agent-dind:latest
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
+    - name: docker-storage
+      mountPath: /var/lib/docker
+    env:
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+    - name: DOCKER_HOST
+      value: "unix:///var/run/docker.sock"
+    command:
+    - cat
+    tty: true
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+      type: Socket
+  - name: docker-storage
+    emptyDir: {}
