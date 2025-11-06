@@ -1,44 +1,7 @@
 pipeline {
     agent {
         kubernetes {
-            yaml """
-apiVersion: v1
-kind: Pod
-spec:
-  containers:
-  - name: jenkins-agent
-    image: devopswithjunaid/jenkins-agent-dind:latest
-    command:
-    - sleep
-    args:
-    - 99d
-    env:
-    - name: DOCKER_HOST
-      value: tcp://localhost:2376
-    - name: DOCKER_TLS_CERTDIR
-      value: /certs
-    - name: DOCKER_TLS_VERIFY
-      value: "1"
-    - name: DOCKER_CERT_PATH
-      value: /certs/client
-    volumeMounts:
-    - name: docker-certs
-      mountPath: /certs/client
-      readOnly: true
-  - name: docker
-    image: docker:dind
-    securityContext:
-      privileged: true
-    env:
-    - name: DOCKER_TLS_CERTDIR
-      value: /certs
-    volumeMounts:
-    - name: docker-certs
-      mountPath: /certs/client
-  volumes:
-  - name: docker-certs
-    emptyDir: {}
-"""
+            yamlFile 'jenkins-dind-pod-template.yaml'
         }
     }
     
@@ -49,130 +12,144 @@ spec:
     }
     
     stages {
-        stage('🔍 Environment Setup') {
+        stage('Checkout') {
             steps {
-                container('jenkins-agent') {
-                    script {
-                        echo "=== ENVIRONMENT SETUP ==="
-                        sh '''
-                            echo "📋 System Info:"
-                            whoami
-                            pwd
-                            echo "Build: ${BUILD_NUMBER}"
-                            
-                            echo "🔧 Tools Check:"
-                            docker --version
-                            aws --version
-                            kubectl version --client
-                            
-                            echo "✅ All tools ready from custom image!"
-                        '''
-                    }
-                }
+                checkout scm
             }
         }
         
-        stage('📥 Checkout') {
+        stage('Wait for Docker Daemon') {
             steps {
-                container('jenkins-agent') {
-                    checkout scm
+                container('dind') {
                     sh '''
-                        echo "📂 Repo Info:"
-                        git log --oneline -3
-                        ls -la
-                        find . -name "Dockerfile"
+                        echo "Waiting for Docker daemon to be ready..."
+                        until docker info > /dev/null 2>&1; do
+                            sleep 1
+                        done
+                        echo "Docker daemon is ready"
                     '''
                 }
             }
         }
         
-        stage('🏗️ Build Images') {
+        stage('Setup Tools') {
+            steps {
+                container('dind') {
+                    sh '''
+                        # Install AWS CLI
+                        apk add --no-cache aws-cli curl
+                        
+                        # Install kubectl
+                        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+                        chmod +x kubectl
+                        mv kubectl /usr/local/bin/
+                        
+                        # Verify tools
+                        docker --version
+                        aws --version
+                        kubectl version --client
+                    '''
+                }
+            }
+        }
+        
+        stage('ECR Login') {
+            steps {
+                container('dind') {
+                    withCredentials([aws(credentialsId: 'aws-credentials')]) {
+                        sh '''
+                            aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Build & Push Images') {
             parallel {
                 stage('Frontend') {
                     steps {
-                        container('jenkins-agent') {
-                            sh '''
-                                cd frontend
-                                docker build -t voting-app:frontend-${BUILD_NUMBER} .
-                            '''
+                        container('dind') {
+                            dir('frontend') {
+                                sh '''
+                                    docker build -t voting-app:frontend-${BUILD_NUMBER} .
+                                    docker tag voting-app:frontend-${BUILD_NUMBER} ${ECR_REGISTRY}/voting-app:frontend-${BUILD_NUMBER}
+                                    docker push ${ECR_REGISTRY}/voting-app:frontend-${BUILD_NUMBER}
+                                '''
+                            }
                         }
                     }
                 }
                 stage('Backend') {
                     steps {
-                        container('jenkins-agent') {
-                            sh '''
-                                cd backend
-                                docker build -t voting-app:backend-${BUILD_NUMBER} .
-                            '''
+                        container('dind') {
+                            dir('backend') {
+                                sh '''
+                                    docker build -t voting-app:backend-${BUILD_NUMBER} .
+                                    docker tag voting-app:backend-${BUILD_NUMBER} ${ECR_REGISTRY}/voting-app:backend-${BUILD_NUMBER}
+                                    docker push ${ECR_REGISTRY}/voting-app:backend-${BUILD_NUMBER}
+                                '''
+                            }
                         }
                     }
                 }
                 stage('Worker') {
                     steps {
-                        container('jenkins-agent') {
-                            sh '''
-                                cd worker
-                                docker build -t voting-app:worker-${BUILD_NUMBER} .
-                            '''
+                        container('dind') {
+                            dir('worker') {
+                                sh '''
+                                    docker build -t voting-app:worker-${BUILD_NUMBER} .
+                                    docker tag voting-app:worker-${BUILD_NUMBER} ${ECR_REGISTRY}/voting-app:worker-${BUILD_NUMBER}
+                                    docker push ${ECR_REGISTRY}/voting-app:worker-${BUILD_NUMBER}
+                                '''
+                            }
                         }
                     }
                 }
             }
         }
         
-        stage('📤 Push to ECR') {
+        stage('Deploy to EKS') {
             steps {
-                container('jenkins-agent') {
-                    withCredentials([aws(credentialsId: 'aws-credentials')]) {
-                        sh '''
-                            # ECR Login
-                            aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                            
-                            # Tag and Push
-                            docker tag voting-app:frontend-${BUILD_NUMBER} ${ECR_REGISTRY}/voting-app:frontend-${BUILD_NUMBER}
-                            docker tag voting-app:backend-${BUILD_NUMBER} ${ECR_REGISTRY}/voting-app:backend-${BUILD_NUMBER}
-                            docker tag voting-app:worker-${BUILD_NUMBER} ${ECR_REGISTRY}/voting-app:worker-${BUILD_NUMBER}
-                            
-                            docker push ${ECR_REGISTRY}/voting-app:frontend-${BUILD_NUMBER}
-                            docker push ${ECR_REGISTRY}/voting-app:backend-${BUILD_NUMBER}
-                            docker push ${ECR_REGISTRY}/voting-app:worker-${BUILD_NUMBER}
-                        '''
-                    }
-                }
-            }
-        }
-        
-        stage('🚀 Deploy to EKS') {
-            steps {
-                container('jenkins-agent') {
+                container('dind') {
                     withCredentials([aws(credentialsId: 'aws-credentials')]) {
                         sh '''
                             # Update kubeconfig
                             aws eks update-kubeconfig --region ${AWS_DEFAULT_REGION} --name ${EKS_CLUSTER_NAME}
                             
-                            # Update manifests
+                            # Update manifests with new image tags
                             sed -i "s|image: 767225687948.dkr.ecr.us-west-2.amazonaws.com/voting-app:frontend-.*|image: ${ECR_REGISTRY}/voting-app:frontend-${BUILD_NUMBER}|g" k8s/frontend.yaml
                             sed -i "s|image: 767225687948.dkr.ecr.us-west-2.amazonaws.com/voting-app:backend-.*|image: ${ECR_REGISTRY}/voting-app:backend-${BUILD_NUMBER}|g" k8s/backend.yaml
                             sed -i "s|image: 767225687948.dkr.ecr.us-west-2.amazonaws.com/voting-app:worker-.*|image: ${ECR_REGISTRY}/voting-app:worker-${BUILD_NUMBER}|g" k8s/worker.yaml
                             
-                            # Deploy
-                            kubectl apply -f k8s/
-                            kubectl rollout status deployment/frontend
-                            kubectl rollout status deployment/backend
-                            kubectl rollout status deployment/worker
+                            # Deploy database first
+                            kubectl apply -f k8s/database.yaml
+                            
+                            # Deploy applications
+                            kubectl apply -f k8s/frontend.yaml
+                            kubectl apply -f k8s/backend.yaml
+                            kubectl apply -f k8s/worker.yaml
+                            
+                            # Wait for deployments
+                            kubectl rollout status deployment/frontend --timeout=300s
+                            kubectl rollout status deployment/backend --timeout=300s
+                            kubectl rollout status deployment/worker --timeout=300s
                         '''
                     }
                 }
             }
         }
         
-        stage('📊 Verify') {
+        stage('Verify Deployment') {
             steps {
-                container('jenkins-agent') {
+                container('dind') {
                     sh '''
+                        echo "=== DEPLOYMENT STATUS ==="
                         kubectl get pods
                         kubectl get svc
+                        
+                        echo "=== APPLICATION HEALTH ==="
+                        kubectl get deployment
                     '''
                 }
             }
@@ -181,8 +158,14 @@ spec:
     
     post {
         always {
-            container('jenkins-agent') {
-                sh 'docker system prune -f || true'
+            container('dind') {
+                sh '''
+                    # Cleanup local images
+                    docker rmi voting-app:frontend-${BUILD_NUMBER} || true
+                    docker rmi voting-app:backend-${BUILD_NUMBER} || true
+                    docker rmi voting-app:worker-${BUILD_NUMBER} || true
+                    docker system prune -f || true
+                '''
             }
         }
         success {
