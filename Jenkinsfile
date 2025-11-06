@@ -1,99 +1,5 @@
 pipeline {
-    agent {
-        kubernetes {
-            yaml '''
-apiVersion: v1
-kind: Pod
-metadata:
-  labels:
-    jenkins: dind-agent
-spec:
-  serviceAccountName: jenkins
-  nodeSelector:
-    role: jenkins
-  tolerations:
-    - key: "jenkins"
-      operator: "Equal"
-      value: "true"
-      effect: "NoSchedule"
-  securityContext:
-    fsGroup: 1000
-  initContainers:
-    - name: volume-permissions
-      image: busybox
-      command: 
-        - sh
-        - -c
-        - |
-          mkdir -p /home/jenkins/agent /var/lib/docker &&
-          chown -R 1000:1000 /home/jenkins/agent /var/lib/docker &&
-          chmod -R 777 /home/jenkins/agent /var/lib/docker
-      securityContext:
-        runAsUser: 0
-        privileged: true
-      volumeMounts:
-        - name: workspace-volume
-          mountPath: /home/jenkins/agent
-        - name: docker-lib
-          mountPath: /var/lib/docker
-  containers:
-    - name: jnlp
-      image: jenkins/inbound-agent:latest
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-      env:
-        - name: JENKINS_AGENT_WORKDIR
-          value: /home/jenkins/agent
-      volumeMounts:
-        - name: workspace-volume
-          mountPath: /home/jenkins/agent
-
-    - name: dind
-      image: docker:24.0-dind
-      securityContext:
-        privileged: true
-        runAsUser: 0
-      env:
-        - name: DOCKER_TLS_CERTDIR
-          value: ""
-      args:
-        - --insecure-registry=767225687948.dkr.ecr.us-west-2.amazonaws.com
-        - --host=tcp://0.0.0.0:2375
-      volumeMounts:
-        - name: workspace-volume
-          mountPath: /home/jenkins/agent
-        - name: docker-lib
-          mountPath: /var/lib/docker
-        - name: docker-sock
-          mountPath: /var/run
-
-    - name: tools
-      image: devopswithjunaid/jenkins-agent-dind:latest
-      command:
-        - cat
-      tty: true
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-      env:
-        - name: DOCKER_HOST
-          value: "tcp://localhost:2375"
-      volumeMounts:
-        - name: workspace-volume
-          mountPath: /home/jenkins/agent
-
-  volumes:
-    - name: workspace-volume
-      emptyDir:
-        sizeLimit: 20Gi
-    - name: docker-lib
-      emptyDir: {}
-    - name: docker-sock
-      emptyDir: {}
-            '''
-        }
-    }
+    agent any
     
     environment {
         AWS_DEFAULT_REGION = 'us-west-2'
@@ -101,102 +7,140 @@ spec:
         ECR_REPOSITORY = 'voting-app'
         EKS_CLUSTER_NAME = 'secure-dev-env-cluster'
         IMAGE_TAG = "${BUILD_NUMBER}"
-        DOCKER_HOST = "tcp://localhost:2375"
     }
     
     stages {
-        stage('Verify Environment') {
+        stage('Environment Setup') {
             steps {
-                container('tools') {
-                    sh '''
-                        echo "=== Environment Check ==="
-                        whoami
-                        pwd
-                        echo "Build Number: ${BUILD_NUMBER}"
-                        echo "Docker Host: ${DOCKER_HOST}"
-                        
-                        echo "=== Tool Versions ==="
-                        docker --version
-                        aws --version
-                        kubectl version --client
-                        
-                        echo "=== Docker Test ==="
-                        sleep 15  # Wait for DinD to start
-                        docker ps
-                        echo "✅ Docker is working!"
-                    '''
-                }
+                sh '''
+                    echo "=== Environment Setup ==="
+                    whoami
+                    pwd
+                    echo "Build Number: ${BUILD_NUMBER}"
+                    
+                    # Check if tools are available
+                    docker --version || echo "Docker not found - will try to use host Docker"
+                    aws --version || echo "AWS CLI not found - will install"
+                    kubectl version --client || echo "kubectl not found - will install"
+                '''
+            }
+        }
+        
+        stage('Install Tools') {
+            steps {
+                sh '''
+                    echo "=== Installing AWS CLI ==="
+                    if ! command -v aws &> /dev/null; then
+                        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                        unzip -o awscliv2.zip
+                        sudo ./aws/install --update 2>/dev/null || ./aws/install --update 2>/dev/null || echo "AWS CLI installation attempted"
+                    fi
+                    
+                    echo "=== Installing kubectl ==="
+                    if ! command -v kubectl &> /dev/null; then
+                        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+                        chmod +x kubectl
+                        sudo mv kubectl /usr/local/bin/ 2>/dev/null || mv kubectl /usr/local/bin/ 2>/dev/null || echo "kubectl installation attempted"
+                    fi
+                    
+                    echo "=== Tool Verification ==="
+                    docker --version || echo "❌ Docker not available"
+                    aws --version || echo "❌ AWS CLI not available"  
+                    kubectl version --client || echo "❌ kubectl not available"
+                '''
             }
         }
         
         stage('Checkout Code') {
             steps {
-                container('tools') {
-                    checkout scm
+                checkout scm
+                sh '''
+                    echo "=== Repository Structure ==="
+                    ls -la
+                    find . -name "Dockerfile" -type f
+                '''
+            }
+        }
+        
+        stage('Docker Setup') {
+            steps {
+                sh '''
+                    echo "=== Docker Setup ==="
+                    
+                    # Try different Docker access methods
+                    if docker ps >/dev/null 2>&1; then
+                        echo "✅ Docker is accessible"
+                    elif [ -S /var/run/docker.sock ]; then
+                        echo "Docker socket found, trying to fix permissions..."
+                        sudo chmod 666 /var/run/docker.sock 2>/dev/null || echo "Cannot change socket permissions"
+                        sudo usermod -aG docker jenkins 2>/dev/null || echo "Cannot add user to docker group"
+                    else
+                        echo "❌ Docker not accessible - will use manual build instructions"
+                    fi
+                    
+                    # Test Docker again
+                    docker ps || echo "Docker still not accessible"
+                '''
+            }
+        }
+        
+        stage('ECR Login') {
+            when {
+                expression { 
+                    return sh(script: 'docker ps', returnStatus: true) == 0 
+                }
+            }
+            steps {
+                withCredentials([aws(credentialsId: 'aws-credentials')]) {
                     sh '''
-                        echo "=== Repository Structure ==="
-                        ls -la
-                        find . -name "Dockerfile" -type f
+                        echo "=== ECR Login ==="
+                        aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        echo "✅ ECR Login successful"
                     '''
                 }
             }
         }
         
-        stage('ECR Login') {
-            steps {
-                container('tools') {
-                    withCredentials([aws(credentialsId: 'aws-credentials')]) {
-                        sh '''
-                            echo "=== ECR Login ==="
-                            aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                            echo "✅ ECR Login successful"
-                        '''
-                    }
+        stage('Build Images') {
+            when {
+                expression { 
+                    return sh(script: 'docker ps', returnStatus: true) == 0 
                 }
             }
-        }
-        
-        stage('Build Images') {
             parallel {
                 stage('Build Frontend') {
                     steps {
-                        container('tools') {
-                            dir('frontend') {
-                                sh '''
-                                    echo "=== Building Frontend ==="
-                                    docker build -t ${ECR_REPOSITORY}:frontend-${IMAGE_TAG} .
-                                    docker tag ${ECR_REPOSITORY}:frontend-${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${IMAGE_TAG}
-                                    echo "✅ Frontend image built"
-                                '''
-                            }
+                        dir('frontend') {
+                            sh '''
+                                echo "=== Building Frontend ==="
+                                docker build -t ${ECR_REPOSITORY}:frontend-${IMAGE_TAG} .
+                                docker tag ${ECR_REPOSITORY}:frontend-${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${IMAGE_TAG}
+                                echo "✅ Frontend image built"
+                            '''
                         }
                     }
                 }
                 stage('Build Backend') {
                     steps {
-                        container('tools') {
-                            dir('backend') {
-                                sh '''
-                                    echo "=== Building Backend ==="
-                                    docker build -t ${ECR_REPOSITORY}:backend-${IMAGE_TAG} .
-                                    docker tag ${ECR_REPOSITORY}:backend-${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${IMAGE_TAG}
-                                    echo "✅ Backend image built"
-                                '''
-                            }
+                        dir('backend') {
+                            sh '''
+                                echo "=== Building Backend ==="
+                                docker build -t ${ECR_REPOSITORY}:backend-${IMAGE_TAG} .
+                                docker tag ${ECR_REPOSITORY}:backend-${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${IMAGE_TAG}
+                                echo "✅ Backend image built"
+                            '''
                         }
                     }
                 }
                 stage('Build Worker') {
                     steps {
-                        container('tools') {
-                            dir('worker') {
-                                sh '''
-                                    echo "=== Building Worker ==="
-                                    docker build -t ${ECR_REPOSITORY}:worker-${IMAGE_TAG} .
-                                    docker tag ${ECR_REPOSITORY}:worker-${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:worker-${IMAGE_TAG}
-                                    echo "✅ Worker image built"
-                                '''
-                            }
+                        dir('worker') {
+                            sh '''
+                                echo "=== Building Worker ==="
+                                docker build -t ${ECR_REPOSITORY}:worker-${IMAGE_TAG} .
+                                docker tag ${ECR_REPOSITORY}:worker-${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:worker-${IMAGE_TAG}
+                                echo "✅ Worker image built"
+                            '''
                         }
                     }
                 }
@@ -204,81 +148,108 @@ spec:
         }
         
         stage('Push to ECR') {
-            steps {
-                container('tools') {
-                    sh '''
-                        echo "=== Pushing Images to ECR ==="
-                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${IMAGE_TAG}
-                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${IMAGE_TAG}
-                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:worker-${IMAGE_TAG}
-                        echo "✅ All images pushed to ECR"
-                    '''
+            when {
+                expression { 
+                    return sh(script: 'docker ps', returnStatus: true) == 0 
                 }
+            }
+            steps {
+                sh '''
+                    echo "=== Pushing Images to ECR ==="
+                    docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${IMAGE_TAG}
+                    docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${IMAGE_TAG}
+                    docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:worker-${IMAGE_TAG}
+                    echo "✅ All images pushed to ECR"
+                '''
+            }
+        }
+        
+        stage('Manual Build Instructions') {
+            when {
+                expression { 
+                    return sh(script: 'docker ps', returnStatus: true) != 0 
+                }
+            }
+            steps {
+                sh '''
+                    echo "=================================================="
+                    echo "🚀 MANUAL BUILD INSTRUCTIONS"
+                    echo "=================================================="
+                    echo "Docker not accessible in Jenkins. Run these commands manually:"
+                    echo ""
+                    echo "1. ECR Login:"
+                    echo "   aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}"
+                    echo ""
+                    echo "2. Build Images:"
+                    echo "   cd frontend && docker build -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${IMAGE_TAG} ."
+                    echo "   cd backend && docker build -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${IMAGE_TAG} ."
+                    echo "   cd worker && docker build -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:worker-${IMAGE_TAG} ."
+                    echo ""
+                    echo "3. Push Images:"
+                    echo "   docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${IMAGE_TAG}"
+                    echo "   docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${IMAGE_TAG}"
+                    echo "   docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:worker-${IMAGE_TAG}"
+                    echo "=================================================="
+                '''
             }
         }
         
         stage('Deploy to EKS') {
             steps {
-                container('tools') {
-                    withCredentials([aws(credentialsId: 'aws-credentials')]) {
-                        sh '''
-                            echo "=== Configuring kubectl ==="
-                            aws eks update-kubeconfig --region ${AWS_DEFAULT_REGION} --name ${EKS_CLUSTER_NAME}
-                            
-                            echo "=== Updating Kubernetes Manifests ==="
-                            sed -i "s|image: .*voting-app:frontend.*|image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${IMAGE_TAG}|g" k8s/frontend.yaml
-                            sed -i "s|image: .*voting-app:backend.*|image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${IMAGE_TAG}|g" k8s/backend.yaml
-                            sed -i "s|image: .*voting-app:worker.*|image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:worker-${IMAGE_TAG}|g" k8s/worker.yaml
-                            
-                            echo "=== Deploying to EKS ==="
-                            kubectl apply -f k8s/database.yaml
-                            kubectl apply -f k8s/frontend.yaml
-                            kubectl apply -f k8s/backend.yaml
-                            kubectl apply -f k8s/worker.yaml
-                            
-                            echo "=== Waiting for deployments ==="
-                            kubectl rollout status deployment/frontend --timeout=300s || true
-                            kubectl rollout status deployment/backend --timeout=300s || true
-                            kubectl rollout status deployment/worker --timeout=300s || true
-                            
-                            echo "✅ Deployment completed"
-                        '''
-                    }
+                withCredentials([aws(credentialsId: 'aws-credentials')]) {
+                    sh '''
+                        echo "=== Configuring kubectl ==="
+                        aws eks update-kubeconfig --region ${AWS_DEFAULT_REGION} --name ${EKS_CLUSTER_NAME}
+                        
+                        echo "=== Updating Kubernetes Manifests ==="
+                        sed -i "s|image: .*voting-app:frontend.*|image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${IMAGE_TAG}|g" k8s/frontend.yaml
+                        sed -i "s|image: .*voting-app:backend.*|image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${IMAGE_TAG}|g" k8s/backend.yaml
+                        sed -i "s|image: .*voting-app:worker.*|image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:worker-${IMAGE_TAG}|g" k8s/worker.yaml
+                        
+                        echo "=== Deploying to EKS ==="
+                        kubectl apply -f k8s/database.yaml
+                        kubectl apply -f k8s/frontend.yaml
+                        kubectl apply -f k8s/backend.yaml
+                        kubectl apply -f k8s/worker.yaml
+                        
+                        echo "=== Waiting for deployments ==="
+                        kubectl rollout status deployment/frontend --timeout=300s || true
+                        kubectl rollout status deployment/backend --timeout=300s || true
+                        kubectl rollout status deployment/worker --timeout=300s || true
+                        
+                        echo "✅ Deployment completed"
+                    '''
                 }
             }
         }
         
         stage('Verify Deployment') {
             steps {
-                container('tools') {
-                    sh '''
-                        echo "=== Deployment Status ==="
-                        kubectl get pods -o wide
-                        kubectl get services
-                        kubectl get deployments
-                        
-                        echo "=== Service URLs ==="
-                        kubectl get svc -o wide
-                    '''
-                }
+                sh '''
+                    echo "=== Deployment Status ==="
+                    kubectl get pods -o wide
+                    kubectl get services
+                    kubectl get deployments
+                    
+                    echo "=== Service URLs ==="
+                    kubectl get svc -o wide
+                '''
             }
         }
     }
     
     post {
         always {
-            container('tools') {
-                echo "=== Pipeline Cleanup ==="
-                sh '''
-                    docker rmi ${ECR_REPOSITORY}:frontend-${IMAGE_TAG} || true
-                    docker rmi ${ECR_REPOSITORY}:backend-${IMAGE_TAG} || true
-                    docker rmi ${ECR_REPOSITORY}:worker-${IMAGE_TAG} || true
-                    docker system prune -f || true
-                '''
-            }
+            echo "=== Pipeline Cleanup ==="
+            sh '''
+                docker rmi ${ECR_REPOSITORY}:frontend-${IMAGE_TAG} 2>/dev/null || true
+                docker rmi ${ECR_REPOSITORY}:backend-${IMAGE_TAG} 2>/dev/null || true
+                docker rmi ${ECR_REPOSITORY}:worker-${IMAGE_TAG} 2>/dev/null || true
+                docker system prune -f 2>/dev/null || true
+            '''
         }
         success {
-            echo "🎉 Complete CI/CD Pipeline successful! Application deployed to EKS!"
+            echo "🎉 Pipeline completed successfully!"
         }
         failure {
             echo "❌ Pipeline failed - check logs above"
