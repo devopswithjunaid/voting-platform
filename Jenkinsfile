@@ -50,9 +50,9 @@ pipeline {
                         checkout scm
                         sh '''
                             echo "📂 Repository Information:"
-                            /mnt/c/Program\ Files/Git/bin/git.exe remote -v
-                            /mnt/c/Program\ Files/Git/bin/git.exe branch -a
-                            /mnt/c/Program\ Files/Git/bin/git.exe log --oneline -3
+                            git remote -v
+                            git branch -a
+                            git log --oneline -3
                             
                             echo "📁 Project Structure:"
                             ls -la
