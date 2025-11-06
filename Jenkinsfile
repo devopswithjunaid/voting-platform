@@ -11,17 +11,19 @@ pipeline {
         ECR_REPOSITORY = 'voting-app'
         EKS_CLUSTER_NAME = 'secure-dev-env-cluster'
         IMAGE_TAG = "${BUILD_NUMBER}"
+        DOCKER_HOST = "tcp://localhost:2375"
     }
     
     stages {
         stage('Verify Environment') {
             steps {
-                container('dind') {
+                container('tools') {
                     sh '''
                         echo "=== Environment Check ==="
                         whoami
                         pwd
                         echo "Build Number: ${BUILD_NUMBER}"
+                        echo "Docker Host: ${DOCKER_HOST}"
                         
                         echo "=== Tool Versions ==="
                         docker --version
@@ -29,6 +31,7 @@ pipeline {
                         kubectl version --client
                         
                         echo "=== Docker Test ==="
+                        sleep 10  # Wait for DinD to start
                         docker ps
                     '''
                 }
@@ -37,7 +40,7 @@ pipeline {
         
         stage('Checkout Code') {
             steps {
-                container('dind') {
+                container('tools') {
                     checkout scm
                     sh '''
                         echo "=== Repository Structure ==="
@@ -50,7 +53,7 @@ pipeline {
         
         stage('ECR Login') {
             steps {
-                container('dind') {
+                container('tools') {
                     withCredentials([aws(credentialsId: 'aws-credentials')]) {
                         sh '''
                             echo "=== ECR Login ==="
@@ -66,7 +69,7 @@ pipeline {
             parallel {
                 stage('Build Frontend') {
                     steps {
-                        container('dind') {
+                        container('tools') {
                             dir('frontend') {
                                 sh '''
                                     echo "=== Building Frontend ==="
@@ -80,7 +83,7 @@ pipeline {
                 }
                 stage('Build Backend') {
                     steps {
-                        container('dind') {
+                        container('tools') {
                             dir('backend') {
                                 sh '''
                                     echo "=== Building Backend ==="
@@ -94,7 +97,7 @@ pipeline {
                 }
                 stage('Build Worker') {
                     steps {
-                        container('dind') {
+                        container('tools') {
                             dir('worker') {
                                 sh '''
                                     echo "=== Building Worker ==="
@@ -111,7 +114,7 @@ pipeline {
         
         stage('Push to ECR') {
             steps {
-                container('dind') {
+                container('tools') {
                     sh '''
                         echo "=== Pushing Images to ECR ==="
                         docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${IMAGE_TAG}
@@ -125,7 +128,7 @@ pipeline {
         
         stage('Deploy to EKS') {
             steps {
-                container('dind') {
+                container('tools') {
                     withCredentials([aws(credentialsId: 'aws-credentials')]) {
                         sh '''
                             echo "=== Configuring kubectl ==="
@@ -156,7 +159,7 @@ pipeline {
         
         stage('Verify Deployment') {
             steps {
-                container('dind') {
+                container('tools') {
                     sh '''
                         echo "=== Deployment Status ==="
                         kubectl get pods -o wide
@@ -173,7 +176,7 @@ pipeline {
     
     post {
         always {
-            container('dind') {
+            container('tools') {
                 echo "=== Pipeline Cleanup ==="
                 sh '''
                     docker rmi ${ECR_REPOSITORY}:frontend-${IMAGE_TAG} || true
