@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: worker
-        image: dockersamples/examplevotingapp_worker:latest
+        image: 767225687948.dkr.ecr.us-west-2.amazonaws.com/voting-app-worker:latest
         env:
         - name: REDIS_HOST
           value: "redis"
