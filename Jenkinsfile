@@ -1,9 +1,5 @@
 pipeline {
-  agent {
-    kubernetes {
-      yamlFile 'jenkins-lightweight-pod.yaml'
-    }
-  }
+  agent any
   
   environment {
     AWS_REGION = 'us-west-2'
@@ -11,115 +7,140 @@ pipeline {
     EKS_CLUSTER = 'infra-env-cluster'
     NAMESPACE = 'voting-app'
     COMMIT_ID = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+    
+    // Tool paths
+    KUBECTL_PATH = '/var/jenkins_home/kubectl'
+    AWS_PATH = '/var/jenkins_home/aws/dist/aws'
   }
   
   stages {
     stage('🔍 Environment Setup') {
       steps {
-        container('aws-cli') {
-          sh '''
-            echo "=== Environment Information ==="
-            echo "AWS Region: ${AWS_REGION}"
-            echo "ECR Registry: ${ECR_REGISTRY}"
-            echo "EKS Cluster: ${EKS_CLUSTER}"
-            echo "Commit ID: ${COMMIT_ID}"
-            echo "Namespace: ${NAMESPACE}"
-            echo ""
-            
-            echo "=== Tool Verification ==="
-            aws --version
-            echo "✅ AWS CLI ready!"
-          '''
-        }
-        container('kubectl') {
-          sh '''
-            kubectl version --client
-            echo "✅ kubectl ready!"
-          '''
-        }
-        container('kaniko') {
-          sh '''
-            echo "Kaniko executor ready!"
-            ls -la /kaniko/.docker/ || echo "ECR credentials will be mounted"
-            echo "✅ Kaniko ready!"
-          '''
-        }
+        sh '''
+          echo "=== Environment Information ==="
+          echo "AWS Region: ${AWS_REGION}"
+          echo "ECR Registry: ${ECR_REGISTRY}"
+          echo "EKS Cluster: ${EKS_CLUSTER}"
+          echo "Commit ID: ${COMMIT_ID}"
+          echo "Namespace: ${NAMESPACE}"
+          echo ""
+          
+          echo "=== Tool Verification ==="
+          ${AWS_PATH} --version
+          ${KUBECTL_PATH} version --client
+          docker --version || echo "Docker starting..."
+          git --version
+          echo "✅ All tools verified!"
+        '''
       }
     }
     
     stage('🔧 AWS & Kubernetes Setup') {
       steps {
-        container('aws-cli') {
-          sh '''
-            echo "=== AWS Configuration ==="
-            aws sts get-caller-identity
-            
-            echo "=== Kubernetes Configuration ==="
-            aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
-          '''
-        }
-        container('kubectl') {
-          sh '''
-            kubectl get nodes
-            echo "✅ Cluster connection verified!"
-          '''
-        }
+        sh '''
+          echo "=== AWS Configuration ==="
+          ${AWS_PATH} sts get-caller-identity
+          
+          echo "=== Kubernetes Configuration ==="
+          mkdir -p /var/jenkins_home/bin
+          ln -sf ${AWS_PATH} /var/jenkins_home/bin/aws
+          export PATH="/var/jenkins_home/bin:$PATH"
+          
+          ${AWS_PATH} eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
+          ${KUBECTL_PATH} get nodes
+          echo "✅ Cluster connection verified!"
+        '''
       }
     }
     
-    stage('📦 Build & Push Images with Kaniko') {
+    stage('🐳 Start Docker Service') {
+      steps {
+        sh '''
+          echo "=== Starting Docker Service ==="
+          # Start Docker daemon if not running
+          service docker start || dockerd &
+          
+          # Wait for Docker to be ready
+          for i in {1..30}; do
+            if docker info >/dev/null 2>&1; then
+              echo "✅ Docker is ready!"
+              break
+            fi
+            echo "Waiting for Docker... ($i/30)"
+            sleep 2
+          done
+          
+          docker --version
+          docker info
+        '''
+      }
+    }
+    
+    stage('📦 Build & Push Images') {
       parallel {
         stage('🗳️ Frontend Service') {
           steps {
-            container('kaniko') {
-              sh """
-                echo "=== Building Frontend Image with Kaniko ==="
-                /kaniko/executor \\
-                  --context=\${WORKSPACE}/frontend \\
-                  --dockerfile=\${WORKSPACE}/frontend/Dockerfile \\
-                  --destination=${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} \\
-                  --destination=${ECR_REGISTRY}/voting-app-frontend:latest \\
-                  --cache=true \\
-                  --cache-ttl=24h
-                echo "✅ Frontend image built and pushed!"
-              """
-            }
+            sh '''
+              echo "=== Building Frontend Image ==="
+              
+              # ECR Login
+              ${AWS_PATH} ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+              
+              # Build image
+              cd frontend
+              docker build -t ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} .
+              docker tag ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-frontend:latest
+              
+              # Push image
+              docker push ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID}
+              docker push ${ECR_REGISTRY}/voting-app-frontend:latest
+              
+              echo "✅ Frontend image pushed successfully!"
+            '''
           }
         }
         
         stage('📊 Backend Service') {
           steps {
-            container('kaniko') {
-              sh """
-                echo "=== Building Backend Image with Kaniko ==="
-                /kaniko/executor \\
-                  --context=\${WORKSPACE}/backend \\
-                  --dockerfile=\${WORKSPACE}/backend/Dockerfile \\
-                  --destination=${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} \\
-                  --destination=${ECR_REGISTRY}/voting-app-backend:latest \\
-                  --cache=true \\
-                  --cache-ttl=24h
-                echo "✅ Backend image built and pushed!"
-              """
-            }
+            sh '''
+              echo "=== Building Backend Image ==="
+              
+              # ECR Login
+              ${AWS_PATH} ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+              
+              # Build image
+              cd backend
+              docker build -t ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} .
+              docker tag ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-backend:latest
+              
+              # Push image
+              docker push ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID}
+              docker push ${ECR_REGISTRY}/voting-app-backend:latest
+              
+              echo "✅ Backend image pushed successfully!"
+            '''
           }
         }
         
         stage('⚙️ Worker Service') {
           steps {
-            container('kaniko') {
-              sh """
-                echo "=== Building Worker Image with Kaniko ==="
-                /kaniko/executor \\
-                  --context=\${WORKSPACE}/worker \\
-                  --dockerfile=\${WORKSPACE}/worker/Dockerfile \\
-                  --destination=${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} \\
-                  --destination=${ECR_REGISTRY}/voting-app-worker:latest \\
-                  --cache=true \\
-                  --cache-ttl=24h
-                echo "✅ Worker image built and pushed!"
-              """
-            }
+            sh '''
+              echo "=== Building Worker Image ==="
+              
+              # ECR Login
+              ${AWS_PATH} ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+              
+              # Build image
+              cd worker
+              docker build -t ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} .
+              docker tag ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-worker:latest
+              
+              # Push image
+              docker push ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID}
+              docker push ${ECR_REGISTRY}/voting-app-worker:latest
+              
+              echo "✅ Worker image pushed successfully!"
+            '''
           }
         }
       }
@@ -127,124 +148,128 @@ pipeline {
     
     stage('✅ Verify Images') {
       steps {
-        container('aws-cli') {
-          sh '''
-            echo "=== Verifying Images in ECR ==="
-            
-            echo "Frontend images:"
-            aws ecr describe-images \\
-              --repository-name voting-app-frontend \\
-              --image-ids imageTag=${COMMIT_ID} \\
-              --region ${AWS_REGION} \\
-              --query 'imageDetails[0].imageTags' || echo "Image not found"
-            
-            echo "Backend images:"
-            aws ecr describe-images \\
-              --repository-name voting-app-backend \\
-              --image-ids imageTag=${COMMIT_ID} \\
-              --region ${AWS_REGION} \\
-              --query 'imageDetails[0].imageTags' || echo "Image not found"
-            
-            echo "Worker images:"
-            aws ecr describe-images \\
-              --repository-name voting-app-worker \\
-              --image-ids imageTag=${COMMIT_ID} \\
-              --region ${AWS_REGION} \\
-              --query 'imageDetails[0].imageTags' || echo "Image not found"
-            
-            echo "✅ All images verified in ECR!"
-          '''
-        }
+        sh '''
+          echo "=== Verifying Images in ECR ==="
+          
+          echo "Frontend images:"
+          ${AWS_PATH} ecr describe-images \\
+            --repository-name voting-app-frontend \\
+            --image-ids imageTag=${COMMIT_ID} \\
+            --region ${AWS_REGION} \\
+            --query 'imageDetails[0].imageTags' || echo "Image not found"
+          
+          echo "Backend images:"
+          ${AWS_PATH} ecr describe-images \\
+            --repository-name voting-app-backend \\
+            --image-ids imageTag=${COMMIT_ID} \\
+            --region ${AWS_REGION} \\
+            --query 'imageDetails[0].imageTags' || echo "Image not found"
+          
+          echo "Worker images:"
+          ${AWS_PATH} ecr describe-images \\
+            --repository-name voting-app-worker \\
+            --image-ids imageTag=${COMMIT_ID} \\
+            --region ${AWS_REGION} \\
+            --query 'imageDetails[0].imageTags' || echo "Image not found"
+          
+          echo "✅ All images verified in ECR!"
+        '''
       }
     }
     
     stage('🚀 Deploy to EKS') {
       steps {
-        container('kubectl') {
-          sh '''
-            echo "=== Deploying to EKS ==="
-            
-            # Create namespace if not exists
-            kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
-            
-            # Apply infrastructure first (Redis, PostgreSQL)
-            echo "Deploying infrastructure..."
-            kubectl apply -f k8s/redis.yaml -n ${NAMESPACE}
-            kubectl apply -f k8s/postgres.yaml -n ${NAMESPACE}
-            
-            # Wait for infrastructure to be ready
-            echo "Waiting for infrastructure..."
-            kubectl wait --for=condition=ready pod -l app=redis -n ${NAMESPACE} --timeout=120s || true
-            kubectl wait --for=condition=ready pod -l app=db -n ${NAMESPACE} --timeout=120s || true
-            
-            # Apply application deployments
-            echo "Deploying applications..."
-            kubectl apply -f k8s/frontend.yaml -n ${NAMESPACE}
-            kubectl apply -f k8s/backend.yaml -n ${NAMESPACE}
-            kubectl apply -f k8s/worker.yaml -n ${NAMESPACE}
-            
-            # Update images with new commit
-            echo "Updating images with commit: ${COMMIT_ID}"
-            kubectl set image deployment/frontend \\
-              frontend=${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} \\
-              -n ${NAMESPACE}
-            
-            kubectl set image deployment/backend \\
-              backend=${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} \\
-              -n ${NAMESPACE}
-            
-            kubectl set image deployment/worker \\
-              worker=${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} \\
-              -n ${NAMESPACE}
-            
-            # Wait for rollout
-            echo "Waiting for deployments to complete..."
-            kubectl rollout status deployment/frontend -n ${NAMESPACE} --timeout=300s
-            kubectl rollout status deployment/backend -n ${NAMESPACE} --timeout=300s
-            kubectl rollout status deployment/worker -n ${NAMESPACE} --timeout=300s
-            
-            # Get service information
-            echo "=== Deployment Status ==="
-            kubectl get pods -n ${NAMESPACE}
-            kubectl get svc -n ${NAMESPACE}
-            
-            echo ""
-            echo "=== LoadBalancer URLs ==="
-            echo "Frontend URL:"
-            kubectl get svc frontend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "LoadBalancer pending..."
-            echo ""
-            echo "Backend URL:"
-            kubectl get svc backend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "LoadBalancer pending..."
-          '''
-        }
+        sh '''
+          echo "=== Deploying to EKS ==="
+          
+          # Setup PATH for aws command
+          export PATH="/var/jenkins_home/bin:$PATH"
+          
+          # Create namespace if not exists
+          ${KUBECTL_PATH} create namespace ${NAMESPACE} --dry-run=client -o yaml | ${KUBECTL_PATH} apply -f -
+          
+          # Apply infrastructure first (Redis, PostgreSQL)
+          echo "Deploying infrastructure..."
+          ${KUBECTL_PATH} apply -f k8s/redis.yaml -n ${NAMESPACE}
+          ${KUBECTL_PATH} apply -f k8s/postgres.yaml -n ${NAMESPACE}
+          
+          # Wait for infrastructure to be ready
+          echo "Waiting for infrastructure..."
+          ${KUBECTL_PATH} wait --for=condition=ready pod -l app=redis -n ${NAMESPACE} --timeout=120s || true
+          ${KUBECTL_PATH} wait --for=condition=ready pod -l app=db -n ${NAMESPACE} --timeout=120s || true
+          
+          # Apply application deployments
+          echo "Deploying applications..."
+          ${KUBECTL_PATH} apply -f k8s/frontend.yaml -n ${NAMESPACE}
+          ${KUBECTL_PATH} apply -f k8s/backend.yaml -n ${NAMESPACE}
+          ${KUBECTL_PATH} apply -f k8s/worker.yaml -n ${NAMESPACE}
+          
+          # Update images with new commit
+          echo "Updating images with commit: ${COMMIT_ID}"
+          ${KUBECTL_PATH} set image deployment/frontend \\
+            frontend=${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} \\
+            -n ${NAMESPACE}
+          
+          ${KUBECTL_PATH} set image deployment/backend \\
+            backend=${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} \\
+            -n ${NAMESPACE}
+          
+          ${KUBECTL_PATH} set image deployment/worker \\
+            worker=${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} \\
+            -n ${NAMESPACE}
+          
+          # Wait for rollout
+          echo "Waiting for deployments to complete..."
+          ${KUBECTL_PATH} rollout status deployment/frontend -n ${NAMESPACE} --timeout=300s
+          ${KUBECTL_PATH} rollout status deployment/backend -n ${NAMESPACE} --timeout=300s
+          ${KUBECTL_PATH} rollout status deployment/worker -n ${NAMESPACE} --timeout=300s
+          
+          # Get service information
+          echo "=== Deployment Status ==="
+          ${KUBECTL_PATH} get pods -n ${NAMESPACE}
+          ${KUBECTL_PATH} get svc -n ${NAMESPACE}
+          
+          echo ""
+          echo "=== LoadBalancer URLs ==="
+          echo "Frontend URL:"
+          ${KUBECTL_PATH} get svc frontend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "LoadBalancer pending..."
+          echo ""
+          echo "Backend URL:"
+          ${KUBECTL_PATH} get svc backend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "LoadBalancer pending..."
+        '''
       }
     }
   }
   
   post {
     success {
-      echo """
-      🎉 =================================="
-      ✅ PIPELINE COMPLETED SUCCESSFULLY!"
-      =================================="
-      
-      🎯 Commit: ${COMMIT_ID}"
-      🌐 Namespace: ${NAMESPACE}"
-      
-      📱 Access your application:"
-      - Frontend (Voting): kubectl get svc frontend -n voting-app"
-      - Backend (Results): kubectl get svc backend -n voting-app"
-      
-      🔍 Check status: kubectl get all -n voting-app"
-      
-      🚀 Your voting app is now live!"
-      """
+      sh '''
+        echo ""
+        echo "🎉 =================================="
+        echo "✅ PIPELINE COMPLETED SUCCESSFULLY!"
+        echo "=================================="
+        echo ""
+        echo "🎯 Commit: ${COMMIT_ID}"
+        echo "🌐 Namespace: ${NAMESPACE}"
+        echo ""
+        echo "📱 Access your application:"
+        echo "- Frontend (Voting): ${KUBECTL_PATH} get svc frontend -n voting-app"
+        echo "- Backend (Results): ${KUBECTL_PATH} get svc backend -n voting-app"
+        echo ""
+        echo "🔍 Check status: ${KUBECTL_PATH} get all -n voting-app"
+        echo ""
+        echo "🚀 Your voting app is now live!"
+      '''
     }
     failure {
       echo '❌ Pipeline failed! Check logs for details.'
     }
     always {
-      echo '🏁 Pipeline execution finished.'
+      sh '''
+        # Cleanup Docker images to save space
+        docker system prune -af || true
+        echo "🏁 Pipeline execution finished."
+      '''
     }
   }
 }
