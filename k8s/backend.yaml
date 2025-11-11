@@ -16,9 +16,9 @@ spec:
     spec:
       containers:
       - name: backend
-        image: 767225687948.dkr.ecr.us-west-2.amazonaws.com/voting-app-backend:latest
+        image: dockersamples/examplevotingapp_result:latest
         ports:
-        - containerPort: 4000
+        - containerPort: 80
         env:
         - name: POSTGRES_HOST
           value: "db"
@@ -46,7 +46,7 @@ spec:
   type: LoadBalancer
   ports:
   - port: 80
-    targetPort: 4000
+    targetPort: 80
     protocol: TCP
   selector:
     app: backend
