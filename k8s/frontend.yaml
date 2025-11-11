@@ -1,12 +1,9 @@
----
-# Frontend (Flask) Deployment
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: frontend
   labels:
     app: frontend
-    tier: presentation
 spec:
   replicas: 2
   selector:
@@ -16,18 +13,15 @@ spec:
     metadata:
       labels:
         app: frontend
-        tier: presentation
     spec:
-      nodeSelector:
-        nodegroup: secure-dev-env-app-nodes
       containers:
       - name: frontend
-        image: 767225687948.dkr.ecr.us-west-2.amazonaws.com/voting-app:frontend-latest
+        image: 767225687948.dkr.ecr.us-west-2.amazonaws.com/voting-app-frontend:latest
         ports:
         - containerPort: 5000
         env:
         - name: REDIS_HOST
-          value: redis
+          value: "redis"
         resources:
           requests:
             memory: "128Mi"
@@ -35,9 +29,7 @@ spec:
           limits:
             memory: "256Mi"
             cpu: "200m"
-
 ---
-# Frontend Service (LoadBalancer for external access)
 apiVersion: v1
 kind: Service
 metadata:
@@ -46,10 +38,9 @@ metadata:
     app: frontend
 spec:
   type: LoadBalancer
-  selector:
-    app: frontend
   ports:
-  - name: http
-    port: 80
+  - port: 80
     targetPort: 5000
     protocol: TCP
+  selector:
+    app: frontend

@@ -1,12 +1,9 @@
----
-# Backend (Node.js) Deployment
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: backend
   labels:
     app: backend
-    tier: logic
 spec:
   replicas: 2
   selector:
@@ -16,18 +13,21 @@ spec:
     metadata:
       labels:
         app: backend
-        tier: logic
     spec:
-      nodeSelector:
-        nodegroup: secure-dev-env-app-nodes
       containers:
       - name: backend
-        image: 767225687948.dkr.ecr.us-west-2.amazonaws.com/voting-app:backend-latest
+        image: 767225687948.dkr.ecr.us-west-2.amazonaws.com/voting-app-backend:latest
         ports:
         - containerPort: 4000
         env:
-        - name: DATABASE_URL
-          value: postgres://postgres:postgres@db/postgres
+        - name: POSTGRES_HOST
+          value: "db"
+        - name: POSTGRES_USER
+          value: "postgres"
+        - name: POSTGRES_PASSWORD
+          value: "postgres"
+        - name: POSTGRES_DB
+          value: "postgres"
         resources:
           requests:
             memory: "128Mi"
@@ -35,9 +35,7 @@ spec:
           limits:
             memory: "256Mi"
             cpu: "200m"
-
 ---
-# Backend Service (LoadBalancer for external access)
 apiVersion: v1
 kind: Service
 metadata:
@@ -46,10 +44,9 @@ metadata:
     app: backend
 spec:
   type: LoadBalancer
-  selector:
-    app: backend
   ports:
-  - name: http
-    port: 80
+  - port: 80
     targetPort: 4000
     protocol: TCP
+  selector:
+    app: backend
