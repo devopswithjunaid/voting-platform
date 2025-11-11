@@ -3,7 +3,6 @@ pipeline {
   
   environment {
     AWS_REGION = 'us-west-2'
-    ECR_REGISTRY = '767225687948.dkr.ecr.us-west-2.amazonaws.com'
     EKS_CLUSTER = 'infra-env-cluster'
     NAMESPACE = 'voting-app'
     COMMIT_ID = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
@@ -19,7 +18,6 @@ pipeline {
         sh '''
           echo "=== Environment Information ==="
           echo "AWS Region: ${AWS_REGION}"
-          echo "ECR Registry: ${ECR_REGISTRY}"
           echo "EKS Cluster: ${EKS_CLUSTER}"
           echo "Commit ID: ${COMMIT_ID}"
           echo "Namespace: ${NAMESPACE}"
@@ -28,7 +26,6 @@ pipeline {
           echo "=== Tool Verification ==="
           ${AWS_PATH} --version
           ${KUBECTL_PATH} version --client
-          docker --version || echo "Docker starting..."
           git --version
           echo "✅ All tools verified!"
         '''
@@ -53,126 +50,15 @@ pipeline {
       }
     }
     
-    stage('🐳 Start Docker Service') {
+    stage('📦 Prepare Deployment') {
       steps {
         sh '''
-          echo "=== Starting Docker Service ==="
-          # Start Docker daemon if not running
-          service docker start || dockerd &
-          
-          # Wait for Docker to be ready
-          for i in {1..30}; do
-            if docker info >/dev/null 2>&1; then
-              echo "✅ Docker is ready!"
-              break
-            fi
-            echo "Waiting for Docker... ($i/30)"
-            sleep 2
-          done
-          
-          docker --version
-          docker info
-        '''
-      }
-    }
-    
-    stage('📦 Build & Push Images') {
-      parallel {
-        stage('🗳️ Frontend Service') {
-          steps {
-            sh '''
-              echo "=== Building Frontend Image ==="
-              
-              # ECR Login
-              ${AWS_PATH} ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-              
-              # Build image
-              cd frontend
-              docker build -t ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} .
-              docker tag ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-frontend:latest
-              
-              # Push image
-              docker push ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID}
-              docker push ${ECR_REGISTRY}/voting-app-frontend:latest
-              
-              echo "✅ Frontend image pushed successfully!"
-            '''
-          }
-        }
-        
-        stage('📊 Backend Service') {
-          steps {
-            sh '''
-              echo "=== Building Backend Image ==="
-              
-              # ECR Login
-              ${AWS_PATH} ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-              
-              # Build image
-              cd backend
-              docker build -t ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} .
-              docker tag ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-backend:latest
-              
-              # Push image
-              docker push ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID}
-              docker push ${ECR_REGISTRY}/voting-app-backend:latest
-              
-              echo "✅ Backend image pushed successfully!"
-            '''
-          }
-        }
-        
-        stage('⚙️ Worker Service') {
-          steps {
-            sh '''
-              echo "=== Building Worker Image ==="
-              
-              # ECR Login
-              ${AWS_PATH} ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-              
-              # Build image
-              cd worker
-              docker build -t ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} .
-              docker tag ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-worker:latest
-              
-              # Push image
-              docker push ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID}
-              docker push ${ECR_REGISTRY}/voting-app-worker:latest
-              
-              echo "✅ Worker image pushed successfully!"
-            '''
-          }
-        }
-      }
-    }
-    
-    stage('✅ Verify Images') {
-      steps {
-        sh '''
-          echo "=== Verifying Images in ECR ==="
-          
-          echo "Frontend images:"
-          ${AWS_PATH} ecr describe-images \\
-            --repository-name voting-app-frontend \\
-            --image-ids imageTag=${COMMIT_ID} \\
-            --region ${AWS_REGION} \\
-            --query 'imageDetails[0].imageTags' || echo "Image not found"
-          
-          echo "Backend images:"
-          ${AWS_PATH} ecr describe-images \\
-            --repository-name voting-app-backend \\
-            --image-ids imageTag=${COMMIT_ID} \\
-            --region ${AWS_REGION} \\
-            --query 'imageDetails[0].imageTags' || echo "Image not found"
-          
-          echo "Worker images:"
-          ${AWS_PATH} ecr describe-images \\
-            --repository-name voting-app-worker \\
-            --image-ids imageTag=${COMMIT_ID} \\
-            --region ${AWS_REGION} \\
-            --query 'imageDetails[0].imageTags' || echo "Image not found"
-          
-          echo "✅ All images verified in ECR!"
+          echo "=== Preparing Deployment ==="
+          echo "Using pre-built Docker images from Docker Hub"
+          echo "Frontend: dockersamples/examplevotingapp_vote:latest"
+          echo "Backend: dockersamples/examplevotingapp_result:latest"
+          echo "Worker: dockersamples/examplevotingapp_worker:latest"
+          echo "✅ Images ready for deployment!"
         '''
       }
     }
@@ -204,19 +90,11 @@ pipeline {
           ${KUBECTL_PATH} apply -f k8s/backend.yaml -n ${NAMESPACE}
           ${KUBECTL_PATH} apply -f k8s/worker.yaml -n ${NAMESPACE}
           
-          # Update images with new commit
-          echo "Updating images with commit: ${COMMIT_ID}"
-          ${KUBECTL_PATH} set image deployment/frontend \\
-            frontend=${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} \\
-            -n ${NAMESPACE}
-          
-          ${KUBECTL_PATH} set image deployment/backend \\
-            backend=${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} \\
-            -n ${NAMESPACE}
-          
-          ${KUBECTL_PATH} set image deployment/worker \\
-            worker=${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} \\
-            -n ${NAMESPACE}
+          # Force restart deployments to ensure latest deployment
+          echo "Restarting deployments..."
+          ${KUBECTL_PATH} rollout restart deployment/frontend -n ${NAMESPACE}
+          ${KUBECTL_PATH} rollout restart deployment/backend -n ${NAMESPACE}
+          ${KUBECTL_PATH} rollout restart deployment/worker -n ${NAMESPACE}
           
           # Wait for rollout
           echo "Waiting for deployments to complete..."
@@ -239,6 +117,31 @@ pipeline {
         '''
       }
     }
+    
+    stage('✅ Verify Deployment') {
+      steps {
+        sh '''
+          echo "=== Verifying Deployment ==="
+          
+          # Check pod status
+          echo "Pod Status:"
+          ${KUBECTL_PATH} get pods -n ${NAMESPACE} -o wide
+          
+          # Check service status
+          echo ""
+          echo "Service Status:"
+          ${KUBECTL_PATH} get svc -n ${NAMESPACE}
+          
+          # Check deployment status
+          echo ""
+          echo "Deployment Status:"
+          ${KUBECTL_PATH} get deployments -n ${NAMESPACE}
+          
+          echo ""
+          echo "✅ Deployment verification complete!"
+        '''
+      }
+    }
   }
   
   post {
@@ -253,23 +156,24 @@ pipeline {
         echo "🌐 Namespace: ${NAMESPACE}"
         echo ""
         echo "📱 Access your application:"
-        echo "- Frontend (Voting): ${KUBECTL_PATH} get svc frontend -n voting-app"
-        echo "- Backend (Results): ${KUBECTL_PATH} get svc backend -n voting-app"
+        echo "- Frontend (Voting): ${KUBECTL_PATH} get svc frontend -n voting-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+        echo "- Backend (Results): ${KUBECTL_PATH} get svc backend -n voting-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
         echo ""
         echo "🔍 Check status: ${KUBECTL_PATH} get all -n voting-app"
         echo ""
         echo "🚀 Your voting app is now live!"
+        echo ""
+        echo "=== Quick Access Commands ==="
+        echo "kubectl get svc -n voting-app"
+        echo "kubectl get pods -n voting-app"
+        echo "kubectl logs -f deployment/frontend -n voting-app"
       '''
     }
     failure {
       echo '❌ Pipeline failed! Check logs for details.'
     }
     always {
-      sh '''
-        # Cleanup Docker images to save space
-        docker system prune -af || true
-        echo "🏁 Pipeline execution finished."
-      '''
+      echo '🏁 Pipeline execution finished.'
     }
   }
 }
