@@ -42,7 +42,15 @@ pipeline {
                     ${AWS_PATH} sts get-caller-identity
                     
                     echo "=== Kubernetes Configuration ==="
+                    # Create symlink for aws in PATH
+                    mkdir -p /var/jenkins_home/bin
+                    ln -sf ${AWS_PATH} /var/jenkins_home/bin/aws
+                    export PATH="/var/jenkins_home/bin:$PATH"
+                    
+                    # Update kubeconfig
                     ${AWS_PATH} eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
+                    
+                    # Test connection
                     ${KUBECTL_PATH} get nodes
                     echo "✅ Cluster connection verified!"
                 '''
@@ -154,6 +162,9 @@ pipeline {
             steps {
                 sh '''
                     echo "=== Deploying to EKS ==="
+                    
+                    # Setup PATH for aws command
+                    export PATH="/var/jenkins_home/bin:$PATH"
                     
                     # Create namespace if not exists
                     ${KUBECTL_PATH} create namespace ${NAMESPACE} --dry-run=client -o yaml | ${KUBECTL_PATH} apply -f -
