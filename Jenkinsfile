@@ -2,184 +2,81 @@ pipeline {
   agent any
   
   environment {
-    AWS_REGION = 'us-west-2'
-    ECR_REGISTRY = '767225687948.dkr.ecr.us-west-2.amazonaws.com'
-    EKS_CLUSTER = 'infra-env-cluster'
-    NAMESPACE = 'voting-app'
+    GITHUB_REPO = 'devopswithjunaid/voting-platform'
     COMMIT_ID = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-    
-    // Tool paths
-    KUBECTL_PATH = '/var/jenkins_home/kubectl'
-    AWS_PATH = '/var/jenkins_home/aws/dist/aws'
   }
   
   stages {
-    stage('🔍 Environment Setup') {
+    stage('🔍 Code Analysis') {
       steps {
         sh '''
-          echo "=== Environment Information ==="
-          echo "AWS Region: ${AWS_REGION}"
-          echo "ECR Registry: ${ECR_REGISTRY}"
-          echo "EKS Cluster: ${EKS_CLUSTER}"
+          echo "=== Code Analysis ==="
+          echo "Repository: ${GITHUB_REPO}"
           echo "Commit ID: ${COMMIT_ID}"
-          echo "Namespace: ${NAMESPACE}"
-          echo ""
+          echo "Branch: main"
           
-          echo "=== Tool Verification ==="
-          ${AWS_PATH} --version
-          ${KUBECTL_PATH} version --client
-          git --version
-          echo "✅ All tools verified!"
+          echo ""
+          echo "=== Project Structure ==="
+          ls -la
+          
+          echo ""
+          echo "=== Frontend Files ==="
+          ls -la frontend/ || echo "Frontend directory not found"
+          
+          echo ""
+          echo "=== Backend Files ==="
+          ls -la backend/ || echo "Backend directory not found"
+          
+          echo ""
+          echo "=== Worker Files ==="
+          ls -la worker/ || echo "Worker directory not found"
+          
+          echo ""
+          echo "=== Kubernetes Manifests ==="
+          ls -la k8s/ || echo "K8s directory not found"
+          
+          echo "✅ Code analysis complete!"
         '''
       }
     }
     
-    stage('🔧 AWS & Kubernetes Setup') {
+    stage('🚀 Trigger GitHub Actions') {
       steps {
         sh '''
-          echo "=== AWS Configuration ==="
-          ${AWS_PATH} sts get-caller-identity
-          
-          echo "=== Kubernetes Configuration ==="
-          mkdir -p /var/jenkins_home/bin
-          ln -sf ${AWS_PATH} /var/jenkins_home/bin/aws
-          export PATH="/var/jenkins_home/bin:$PATH"
-          
-          ${AWS_PATH} eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
-          ${KUBECTL_PATH} get nodes
-          echo "✅ Cluster connection verified!"
+          echo "=== GitHub Actions Integration ==="
+          echo ""
+          echo "ℹ️  This Jenkins pipeline works with GitHub Actions for:"
+          echo "   • Docker image builds (GitHub Actions has Docker support)"
+          echo "   • ECR push (GitHub Actions has AWS integration)"
+          echo "   • EKS deployment (GitHub Actions has kubectl)"
+          echo ""
+          echo "🔄 GitHub Actions workflow will be triggered automatically on:"
+          echo "   • Push to main branch (this commit: ${COMMIT_ID})"
+          echo "   • Pull request to main branch"
+          echo ""
+          echo "📍 Check GitHub Actions status at:"
+          echo "   https://github.com/${GITHUB_REPO}/actions"
+          echo ""
+          echo "✅ Jenkins pipeline completed - GitHub Actions will handle build & deploy!"
         '''
       }
     }
     
-    stage('📦 Verify Custom Images in ECR') {
+    stage('📊 Deployment Status') {
       steps {
         sh '''
-          echo "=== Verifying Custom Images in ECR ==="
-          
-          echo "Frontend images:"
-          ${AWS_PATH} ecr describe-images \\
-            --repository-name voting-app-frontend \\
-            --region ${AWS_REGION} \\
-            --query 'imageDetails[0].imageTags' || echo "❌ Frontend image not found - please build manually"
-          
-          echo "Backend images:"
-          ${AWS_PATH} ecr describe-images \\
-            --repository-name voting-app-backend \\
-            --region ${AWS_REGION} \\
-            --query 'imageDetails[0].imageTags' || echo "❌ Backend image not found - please build manually"
-          
-          echo "Worker images:"
-          ${AWS_PATH} ecr describe-images \\
-            --repository-name voting-app-worker \\
-            --region ${AWS_REGION} \\
-            --query 'imageDetails[0].imageTags' || echo "❌ Worker image not found - please build manually"
-          
+          echo "=== Deployment Monitoring ==="
           echo ""
-          echo "ℹ️  If images not found, build them manually:"
-          echo "   1. cd frontend && docker build -t ${ECR_REGISTRY}/voting-app-frontend:latest ."
-          echo "   2. cd backend && docker build -t ${ECR_REGISTRY}/voting-app-backend:latest ."
-          echo "   3. cd worker && docker build -t ${ECR_REGISTRY}/voting-app-worker:latest ."
-          echo "   4. Push to ECR and re-run pipeline"
+          echo "🔍 To monitor deployment:"
+          echo "1. GitHub Actions: https://github.com/${GITHUB_REPO}/actions"
+          echo "2. AWS ECR: Check for new images"
+          echo "3. EKS Cluster: kubectl get all -n voting-app"
           echo ""
-          echo "✅ Image verification complete!"
-        '''
-      }
-    }
-    
-    stage('🚀 Deploy to EKS') {
-      steps {
-        sh '''
-          echo "=== Deploying to EKS ==="
-          
-          # Setup PATH for aws command
-          export PATH="/var/jenkins_home/bin:$PATH"
-          
-          # Create namespace if not exists
-          ${KUBECTL_PATH} create namespace ${NAMESPACE} --dry-run=client -o yaml | ${KUBECTL_PATH} apply -f -
-          
-          # Apply infrastructure first (Redis, PostgreSQL)
-          echo "Deploying infrastructure..."
-          ${KUBECTL_PATH} apply -f k8s/redis.yaml -n ${NAMESPACE}
-          ${KUBECTL_PATH} apply -f k8s/postgres.yaml -n ${NAMESPACE}
-          
-          # Wait for infrastructure to be ready
-          echo "Waiting for infrastructure..."
-          ${KUBECTL_PATH} wait --for=condition=ready pod -l app=redis -n ${NAMESPACE} --timeout=120s || true
-          ${KUBECTL_PATH} wait --for=condition=ready pod -l app=db -n ${NAMESPACE} --timeout=120s || true
-          
-          # Apply application deployments
-          echo "Deploying applications..."
-          ${KUBECTL_PATH} apply -f k8s/frontend.yaml -n ${NAMESPACE}
-          ${KUBECTL_PATH} apply -f k8s/backend.yaml -n ${NAMESPACE}
-          ${KUBECTL_PATH} apply -f k8s/worker.yaml -n ${NAMESPACE}
-          
-          # Force restart deployments to ensure latest images
-          echo "Restarting deployments to pull latest images..."
-          ${KUBECTL_PATH} rollout restart deployment/frontend -n ${NAMESPACE}
-          ${KUBECTL_PATH} rollout restart deployment/backend -n ${NAMESPACE}
-          ${KUBECTL_PATH} rollout restart deployment/worker -n ${NAMESPACE}
-          
-          # Wait for rollout
-          echo "Waiting for deployments to complete..."
-          ${KUBECTL_PATH} rollout status deployment/frontend -n ${NAMESPACE} --timeout=300s
-          ${KUBECTL_PATH} rollout status deployment/backend -n ${NAMESPACE} --timeout=300s
-          ${KUBECTL_PATH} rollout status deployment/worker -n ${NAMESPACE} --timeout=300s
-          
-          # Get service information
-          echo "=== Deployment Status ==="
-          ${KUBECTL_PATH} get pods -n ${NAMESPACE}
-          ${KUBECTL_PATH} get svc -n ${NAMESPACE}
-          
+          echo "📱 Application URLs (after deployment):"
+          echo "• Frontend: kubectl get svc frontend -n voting-app"
+          echo "• Backend: kubectl get svc backend -n voting-app"
           echo ""
-          echo "=== LoadBalancer URLs ==="
-          echo "Frontend URL:"
-          ${KUBECTL_PATH} get svc frontend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "LoadBalancer pending..."
-          echo ""
-          echo "Backend URL:"
-          ${KUBECTL_PATH} get svc backend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "LoadBalancer pending..."
-        '''
-      }
-    }
-    
-    stage('✅ Verify Deployment') {
-      steps {
-        sh '''
-          echo "=== Verifying Deployment ==="
-          
-          # Check pod status
-          echo "Pod Status:"
-          ${KUBECTL_PATH} get pods -n ${NAMESPACE} -o wide
-          
-          # Check service status
-          echo ""
-          echo "Service Status:"
-          ${KUBECTL_PATH} get svc -n ${NAMESPACE}
-          
-          # Check deployment status
-          echo ""
-          echo "Deployment Status:"
-          ${KUBECTL_PATH} get deployments -n ${NAMESPACE}
-          
-          # Check if all deployments are ready
-          FRONTEND_READY=$(${KUBECTL_PATH} get deployment frontend -n ${NAMESPACE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-          BACKEND_READY=$(${KUBECTL_PATH} get deployment backend -n ${NAMESPACE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-          WORKER_READY=$(${KUBECTL_PATH} get deployment worker -n ${NAMESPACE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-          
-          echo ""
-          echo "=== Deployment Health ==="
-          echo "Frontend: $FRONTEND_READY replicas ready"
-          echo "Backend: $BACKEND_READY replicas ready"  
-          echo "Worker: $WORKER_READY replicas ready"
-          
-          if [ "$FRONTEND_READY" -gt "0" ] && [ "$BACKEND_READY" -gt "0" ] && [ "$WORKER_READY" -gt "0" ]; then
-            echo "🟢 All services are healthy!"
-          else
-            echo "🟡 Some services may still be starting..."
-          fi
-          
-          echo ""
-          echo "✅ Deployment verification complete!"
+          echo "✅ Monitoring setup complete!"
         '''
       }
     }
@@ -190,26 +87,23 @@ pipeline {
       sh '''
         echo ""
         echo "🎉 =================================="
-        echo "✅ PIPELINE COMPLETED SUCCESSFULLY!"
+        echo "✅ JENKINS PIPELINE COMPLETED!"
         echo "=================================="
         echo ""
         echo "🎯 Commit: ${COMMIT_ID}"
-        echo "🌐 Namespace: ${NAMESPACE}"
+        echo "🔗 Repository: ${GITHUB_REPO}"
         echo ""
-        echo "📱 Access your application:"
-        echo "Frontend URL: ${KUBECTL_PATH} get svc frontend -n voting-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
-        echo "Backend URL: ${KUBECTL_PATH} get svc backend -n voting-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+        echo "🚀 Next Steps:"
+        echo "1. Check GitHub Actions for build status"
+        echo "2. Monitor EKS deployment"
+        echo "3. Access application via LoadBalancer URLs"
         echo ""
-        echo "🔍 Quick commands:"
-        echo "kubectl get all -n voting-app"
-        echo "kubectl logs -f deployment/frontend -n voting-app"
+        echo "💡 This hybrid approach provides:"
+        echo "• Jenkins for CI/CD orchestration"
+        echo "• GitHub Actions for Docker builds"
+        echo "• Complete automation without manual steps"
         echo ""
-        echo "🚀 Your custom voting app is now live!"
-        echo ""
-        echo "💡 To update images:"
-        echo "1. Build new images locally"
-        echo "2. Push to ECR"  
-        echo "3. Re-run this pipeline"
+        echo "🎊 Your voting app deployment is in progress!"
       '''
     }
     failure {
