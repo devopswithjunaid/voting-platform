@@ -1,7 +1,7 @@
 pipeline {
   agent {
     kubernetes {
-      yamlFile 'jenkins-dind-pod-template.yaml'
+      yamlFile 'jenkins-simple-pod.yaml'
     }
   }
   
@@ -16,7 +16,7 @@ pipeline {
   stages {
     stage('🔍 Environment Setup') {
       steps {
-        container('dind') {
+        container('aws-cli') {
           sh '''
             echo "=== Environment Information ==="
             echo "AWS Region: ${AWS_REGION}"
@@ -26,36 +26,22 @@ pipeline {
             echo "Namespace: ${NAMESPACE}"
             echo ""
             
-            echo "=== Waiting for Docker daemon ==="
-            until docker info > /dev/null 2>&1; do
-              echo "Waiting for Docker daemon..."
-              sleep 2
-            done
-            echo "✅ Docker daemon is ready!"
+            echo "=== Tool Verification ==="
+            aws --version
+            echo "✅ AWS CLI ready!"
           '''
         }
-      }
-    }
-    
-    stage('🔧 Install Tools') {
-      steps {
-        container('dind') {
+        container('kubectl') {
           sh '''
-            echo "=== Installing Tools ==="
-            
-            # Install AWS CLI
-            apk add --no-cache aws-cli curl jq
-            
-            # Install kubectl
-            curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
-            chmod +x kubectl
-            mv kubectl /usr/local/bin/
-            
-            # Verify installations
-            echo "AWS CLI: $(aws --version)"
-            echo "kubectl: $(kubectl version --client --short)"
-            echo "Docker: $(docker --version)"
-            echo "✅ All tools installed!"
+            kubectl version --client
+            echo "✅ kubectl ready!"
+          '''
+        }
+        container('kaniko') {
+          sh '''
+            echo "Kaniko executor ready!"
+            ls -la /kaniko/.docker/ || echo "ECR credentials will be mounted"
+            echo "✅ Kaniko ready!"
           '''
         }
       }
@@ -63,14 +49,17 @@ pipeline {
     
     stage('🔧 AWS & Kubernetes Setup') {
       steps {
-        container('dind') {
+        container('aws-cli') {
           sh '''
             echo "=== AWS Configuration ==="
-            # Use IAM role from EKS node
             aws sts get-caller-identity
             
             echo "=== Kubernetes Configuration ==="
             aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
+          '''
+        }
+        container('kubectl') {
+          sh '''
             kubectl get nodes
             echo "✅ Cluster connection verified!"
           '''
@@ -78,76 +67,58 @@ pipeline {
       }
     }
     
-    stage('📦 Build & Push Images') {
+    stage('📦 Build & Push Images with Kaniko') {
       parallel {
         stage('🗳️ Frontend Service') {
           steps {
-            container('dind') {
-              sh '''
-                echo "=== Building Frontend Image ==="
-                
-                # ECR Login
-                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                
-                # Build image
-                cd frontend
-                docker build -t ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} .
-                docker tag ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-frontend:latest
-                
-                # Push image
-                docker push ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID}
-                docker push ${ECR_REGISTRY}/voting-app-frontend:latest
-                
-                echo "✅ Frontend image pushed successfully!"
-              '''
+            container('kaniko') {
+              sh """
+                echo "=== Building Frontend Image with Kaniko ==="
+                /kaniko/executor \\
+                  --context=\${WORKSPACE}/frontend \\
+                  --dockerfile=\${WORKSPACE}/frontend/Dockerfile \\
+                  --destination=${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} \\
+                  --destination=${ECR_REGISTRY}/voting-app-frontend:latest \\
+                  --cache=true \\
+                  --cache-ttl=24h
+                echo "✅ Frontend image built and pushed!"
+              """
             }
           }
         }
         
         stage('📊 Backend Service') {
           steps {
-            container('dind') {
-              sh '''
-                echo "=== Building Backend Image ==="
-                
-                # ECR Login
-                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                
-                # Build image
-                cd backend
-                docker build -t ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} .
-                docker tag ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-backend:latest
-                
-                # Push image
-                docker push ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID}
-                docker push ${ECR_REGISTRY}/voting-app-backend:latest
-                
-                echo "✅ Backend image pushed successfully!"
-              '''
+            container('kaniko') {
+              sh """
+                echo "=== Building Backend Image with Kaniko ==="
+                /kaniko/executor \\
+                  --context=\${WORKSPACE}/backend \\
+                  --dockerfile=\${WORKSPACE}/backend/Dockerfile \\
+                  --destination=${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} \\
+                  --destination=${ECR_REGISTRY}/voting-app-backend:latest \\
+                  --cache=true \\
+                  --cache-ttl=24h
+                echo "✅ Backend image built and pushed!"
+              """
             }
           }
         }
         
         stage('⚙️ Worker Service') {
           steps {
-            container('dind') {
-              sh '''
-                echo "=== Building Worker Image ==="
-                
-                # ECR Login
-                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                
-                # Build image
-                cd worker
-                docker build -t ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} .
-                docker tag ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-worker:latest
-                
-                # Push image
-                docker push ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID}
-                docker push ${ECR_REGISTRY}/voting-app-worker:latest
-                
-                echo "✅ Worker image pushed successfully!"
-              '''
+            container('kaniko') {
+              sh """
+                echo "=== Building Worker Image with Kaniko ==="
+                /kaniko/executor \\
+                  --context=\${WORKSPACE}/worker \\
+                  --dockerfile=\${WORKSPACE}/worker/Dockerfile \\
+                  --destination=${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} \\
+                  --destination=${ECR_REGISTRY}/voting-app-worker:latest \\
+                  --cache=true \\
+                  --cache-ttl=24h
+                echo "✅ Worker image built and pushed!"
+              """
             }
           }
         }
@@ -156,7 +127,7 @@ pipeline {
     
     stage('✅ Verify Images') {
       steps {
-        container('dind') {
+        container('aws-cli') {
           sh '''
             echo "=== Verifying Images in ECR ==="
             
@@ -189,7 +160,7 @@ pipeline {
     
     stage('🚀 Deploy to EKS') {
       steps {
-        container('dind') {
+        container('kubectl') {
           sh '''
             echo "=== Deploying to EKS ==="
             
@@ -252,37 +223,28 @@ pipeline {
   
   post {
     success {
-      container('dind') {
-        sh '''
-          echo ""
-          echo "🎉 =================================="
-          echo "✅ PIPELINE COMPLETED SUCCESSFULLY!"
-          echo "=================================="
-          echo ""
-          echo "🎯 Commit: ${COMMIT_ID}"
-          echo "🌐 Namespace: ${NAMESPACE}"
-          echo ""
-          echo "📱 Access your application:"
-          echo "- Frontend (Voting): kubectl get svc frontend -n voting-app"
-          echo "- Backend (Results): kubectl get svc backend -n voting-app"
-          echo ""
-          echo "🔍 Check status: kubectl get all -n voting-app"
-          echo ""
-          echo "🚀 Your voting app is now live!"
-        '''
-      }
+      echo """
+      🎉 =================================="
+      ✅ PIPELINE COMPLETED SUCCESSFULLY!"
+      =================================="
+      
+      🎯 Commit: ${COMMIT_ID}"
+      🌐 Namespace: ${NAMESPACE}"
+      
+      📱 Access your application:"
+      - Frontend (Voting): kubectl get svc frontend -n voting-app"
+      - Backend (Results): kubectl get svc backend -n voting-app"
+      
+      🔍 Check status: kubectl get all -n voting-app"
+      
+      🚀 Your voting app is now live!"
+      """
     }
     failure {
       echo '❌ Pipeline failed! Check logs for details.'
     }
     always {
-      container('dind') {
-        sh '''
-          # Cleanup Docker images to save space
-          docker system prune -af || true
-          echo "🏁 Pipeline execution finished."
-        '''
-      }
+      echo '🏁 Pipeline execution finished.'
     }
   }
 }
