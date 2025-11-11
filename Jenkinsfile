@@ -4,7 +4,7 @@ pipeline {
     environment {
         AWS_REGION = 'us-west-2'
         ECR_REGISTRY = '767225687948.dkr.ecr.us-west-2.amazonaws.com'
-        EKS_CLUSTER = 'secure-dev-env-cluster'
+        EKS_CLUSTER = 'infra-env-cluster'
         NAMESPACE = 'voting-app'
         COMMIT_ID = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
         
