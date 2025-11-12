@@ -1,7 +1,40 @@
 pipeline {
   agent {
     kubernetes {
-      yamlFile 'jenkins-dind-working-final.yaml'
+      yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins
+  containers:
+  - name: dind
+    image: docker:24.0-dind
+    securityContext:
+      privileged: true
+    env:
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+    args:
+    - --insecure-registry=767225687948.dkr.ecr.us-west-2.amazonaws.com
+    - --host=tcp://0.0.0.0:2375
+    volumeMounts:
+    - name: workspace
+      mountPath: /workspace
+    - name: docker-lib
+      mountPath: /var/lib/docker
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "500m"
+      limits:
+        memory: "1Gi"
+        cpu: "1000m"
+  volumes:
+  - name: workspace
+    emptyDir: {}
+  - name: docker-lib
+    emptyDir: {}
+"""
     }
   }
   
@@ -31,7 +64,7 @@ pipeline {
             until docker info > /dev/null 2>&1; do
               sleep 1
             done
-            echo "Docker daemon is ready"
+            echo "✅ Docker daemon is ready!"
             docker --version
           '''
         }
@@ -45,16 +78,17 @@ pipeline {
             echo "Installing tools in DinD container..."
             
             # Install AWS CLI
-            apk add --no-cache aws-cli curl jq
+            apk add --no-cache aws-cli curl jq git
 
             # Install kubectl
-            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
             chmod +x kubectl
             mv kubectl /usr/local/bin/
             
             # Verify installations
             aws --version
             kubectl version --client
+            git --version
             echo "✅ All tools installed successfully!"
           '''
         }
@@ -80,6 +114,20 @@ pipeline {
       }
     }
     
+    stage('Copy Source Code') {
+      steps {
+        container('dind') {
+          sh '''
+            echo "Copying source code to workspace..."
+            cp -r . /workspace/
+            cd /workspace
+            ls -la
+            echo "✅ Source code copied successfully!"
+          '''
+        }
+      }
+    }
+    
     stage('ECR Login') {
       steps {
         container('dind') {
@@ -95,15 +143,14 @@ pipeline {
     stage('Build & Push Frontend') {
       steps {
         container('dind') {
-          dir('frontend') {
-            sh '''
-              echo "Building Frontend (Flask App)..."
-              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_FRONTEND:latest .
-              docker tag $ECR_REPO_FRONTEND:latest $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
-              docker push $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
-              echo "✅ Frontend image pushed successfully!"
-            '''
-          }
+          sh '''
+            echo "Building Frontend (Flask App)..."
+            cd /workspace/frontend
+            DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_FRONTEND:latest .
+            docker tag $ECR_REPO_FRONTEND:latest $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
+            docker push $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
+            echo "✅ Frontend image pushed successfully!"
+          '''
         }
       }
     }
@@ -111,15 +158,14 @@ pipeline {
     stage('Build & Push Backend') {
       steps {
         container('dind') {
-          dir('backend') {
-            sh '''
-              echo "Building Backend (Node.js App)..."
-              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_BACKEND:latest .
-              docker tag $ECR_REPO_BACKEND:latest $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
-              docker push $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
-              echo "✅ Backend image pushed successfully!"
-            '''
-          }
+          sh '''
+            echo "Building Backend (Node.js App)..."
+            cd /workspace/backend
+            DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_BACKEND:latest .
+            docker tag $ECR_REPO_BACKEND:latest $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
+            docker push $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
+            echo "✅ Backend image pushed successfully!"
+          '''
         }
       }
     }
@@ -127,15 +173,14 @@ pipeline {
     stage('Build & Push Worker') {
       steps {
         container('dind') {
-          dir('worker') {
-            sh '''
-              echo "Building Worker (.NET App)..."
-              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_WORKER:latest .
-              docker tag $ECR_REPO_WORKER:latest $ECR_REGISTRY/$ECR_REPO_WORKER:latest
-              docker push $ECR_REGISTRY/$ECR_REPO_WORKER:latest
-              echo "✅ Worker image pushed successfully!"
-            '''
-          }
+          sh '''
+            echo "Building Worker (.NET App)..."
+            cd /workspace/worker
+            DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_WORKER:latest .
+            docker tag $ECR_REPO_WORKER:latest $ECR_REGISTRY/$ECR_REPO_WORKER:latest
+            docker push $ECR_REGISTRY/$ECR_REPO_WORKER:latest
+            echo "✅ Worker image pushed successfully!"
+          '''
         }
       }
     }
@@ -151,6 +196,8 @@ pipeline {
               mkdir -p ~/.kube
               cat $KUBECONFIG > ~/.kube/config
               chmod 600 ~/.kube/config
+              
+              cd /workspace
               
               # Create namespace
               kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
@@ -222,7 +269,7 @@ pipeline {
     success {
       echo '''
         🎉 =================================="
-        ✅ DOCKER-IN-DOCKER PIPELINE SUCCESS!"
+        ✅ PURE DIND PIPELINE SUCCESS!"
         =================================="
         
         🎯 Custom Images Built & Deployed:"
@@ -236,10 +283,12 @@ pipeline {
         kubectl get svc -n voting-app"
         
         💡 Your custom code is now running in production!"
+        
+        🔥 Pure Docker-in-Docker approach - NO JNLP!"
       '''
     }
     failure {
-      echo '❌ Docker-in-Docker pipeline failed! Check logs for details.'
+      echo '❌ Pure DinD pipeline failed! Check logs for details.'
     }
   }
 }
