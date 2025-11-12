@@ -1,52 +1,34 @@
-# Custom Jenkins Agent with Docker, AWS CLI, kubectl
-FROM jenkins/inbound-agent:latest
+FROM openjdk:17-jdk-alpine
 
-# Switch to root to install packages
-USER root
+# Create jenkins user
+RUN addgroup -S jenkins && adduser -S -G jenkins -u 1000 jenkins
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Install common tools
+RUN apk add --no-cache \
+    bash \
     curl \
-    wget \
-    unzip \
+    jq \
     git \
+    openssh \
+    python3 \
+    py3-pip \
     ca-certificates \
-    gnupg \
-    lsb-release \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Docker
-RUN curl -fsSL https://get.docker.com -o get-docker.sh && \
-    sh get-docker.sh && \
-    rm get-docker.sh && \
-    usermod -aG docker jenkins
-
-# Install AWS CLI v2
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
-    unzip awscliv2.zip && \
-    ./aws/install && \
-    rm -rf aws awscliv2.zip
+    docker-cli \
+    && pip3 install --no-cache-dir awscli
 
 # Install kubectl
-RUN curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl" && \
-    chmod +x kubectl && \
-    mv kubectl /usr/local/bin/
+RUN curl -L -o /tmp/kubectl https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl \
+    && chmod +x /tmp/kubectl && mv /tmp/kubectl /usr/local/bin/kubectl
 
-# Install Docker Compose
-RUN curl -L "https://github.com/docker/compose/releases/download/v2.21.0/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose && \
-    chmod +x /usr/local/bin/docker-compose
+# Install helm
+RUN curl -fsSL https://get.helm.sh/helm-v3.12.0-linux-amd64.tar.gz -o /tmp/helm.tar.gz \
+    && tar -xzvf /tmp/helm.tar.gz -C /tmp \
+    && mv /tmp/linux-amd64/helm /usr/local/bin/helm \
+    && rm -rf /tmp/*
 
-# Create docker group and add jenkins user
-RUN groupadd -f docker && usermod -aG docker jenkins
+# Set user and workspace
+USER 1000:1000
+ENV HOME=/home/jenkins
+WORKDIR /home/jenkins
 
-# Switch back to jenkins user
-USER jenkins
-
-# Verify installations
-RUN aws --version && \
-    kubectl version --client && \
-    docker --version && \
-    docker-compose --version
-
-# Set working directory
-WORKDIR /home/jenkins/agent
+CMD ["cat"]

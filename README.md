@@ -1,94 +1,172 @@
 # Three-Tier Voting Application
 
-A simple three-tier web application demonstrating modern application architecture with Jenkins CI/CD pipeline.
+A simple voting application demonstrating modern three-tier architecture with containerized deployment options.
 
-## Architecture
+## Architecture Overview
 
-This application follows a classic three-tier architecture:
-
-### 1. Presentation Tier (Frontend)
+### Tier 1: Presentation Layer (Frontend)
 - **Technology**: Python Flask
-- **Location**: `/frontend/`
-- **Purpose**: User interface for voting
 - **Port**: 5000
+- **Function**: User voting interface
 
-### 2. Logic Tier (Backend)
+### Tier 2: Business Logic Layer (Backend)
 - **Technology**: Node.js Express
-- **Location**: `/backend/`
-- **Purpose**: Results display and API
 - **Port**: 4000
+- **Function**: Results API and display
 
-### 3. Data Tier (Database & Cache)
+### Tier 3: Data Layer
 - **Database**: PostgreSQL (persistent storage)
 - **Cache**: Redis (message queue)
-- **Worker**: .NET Core (processes votes)
+- **Worker**: .NET Core (vote processor)
 
 ## Application Flow
 
-1. **User votes** → Frontend (Flask) → Redis queue
-2. **Worker processes** → Redis queue → PostgreSQL database
-3. **Results display** → Backend (Node.js) → PostgreSQL → User
+1. User votes → Frontend (Flask) → Redis queue
+2. Worker processes → Redis queue → PostgreSQL database
+3. Results display → Backend (Node.js) → PostgreSQL → User
+
+## Quick Start
+
+### Using Docker Compose (Recommended for local development)
+
+```bash
+# Clone and navigate to project
+git clone <repository-url>
+cd voting-platform
+
+# Start all services
+docker-compose up --build
+
+# Access applications
+# Voting: http://localhost:5000
+# Results: http://localhost:4000
+```
+
+### Using Kubernetes
+
+```bash
+# Apply all manifests
+kubectl apply -f k8s/
+
+# Get service URLs
+kubectl get services
+
+# Access via LoadBalancer IPs
+```
+
+## Project Structure
+
+```
+voting-platform/
+├── frontend/           # Flask voting interface
+│   ├── app.py         # Main application
+│   ├── Dockerfile     # Container config
+│   ├── requirements.txt
+│   └── templates/
+├── backend/           # Node.js results API
+│   ├── server.js      # Main application
+│   ├── Dockerfile     # Container config
+│   ├── package.json
+│   └── public/
+├── worker/            # .NET vote processor
+│   ├── Program.cs     # Main application
+│   ├── Dockerfile     # Container config
+│   └── Worker.csproj
+├── k8s/              # Kubernetes manifests
+│   ├── frontend.yaml
+│   ├── backend.yaml
+│   ├── worker.yaml
+│   ├── postgres.yaml
+│   └── redis.yaml
+└── docker-compose.yml # Local development
+```
 
 ## Components
 
-### Frontend (Presentation Layer)
-- Simple voting interface
-- Stores votes in Redis queue
-- Prevents duplicate voting per browser
+### Frontend (Flask)
+- Simple voting interface with two options
+- Prevents duplicate voting per browser session
+- Stores votes in Redis queue for processing
 
-### Backend (Business Logic Layer)
-- REST API for vote results
+### Backend (Node.js)
+- REST API endpoint: `/api/votes`
 - Real-time results display
-- Connects to PostgreSQL for data retrieval
+- Connects to PostgreSQL for vote counts
 
-### Worker (Data Processing Layer)
+### Worker (.NET Core)
 - Processes votes from Redis queue
 - Stores votes in PostgreSQL database
-- Handles database operations
+- Handles duplicate vote updates
 
-### Data Layer
-- **Redis**: Message queue for vote processing
-- **PostgreSQL**: Persistent storage for votes
+### Data Services
+- **Redis**: Message queue for asynchronous vote processing
+- **PostgreSQL**: Persistent storage for vote data
 
-## CI/CD Pipeline
+## Environment Variables
 
-### Jenkins Pipeline Features
-- **Docker-in-Docker (DinD)**: Custom Jenkins agent with Docker, AWS CLI, kubectl
-- **Parallel Builds**: Frontend, Backend, Worker built simultaneously
-- **ECR Integration**: Images pushed to AWS ECR
-- **EKS Deployment**: Automated deployment to Kubernetes cluster
+### Backend
+- `POSTGRES_HOST`: Database host (default: db)
+- `POSTGRES_USER`: Database user (default: postgres)
+- `POSTGRES_PASSWORD`: Database password (default: postgres)
+- `POSTGRES_DB`: Database name (default: postgres)
 
-### Pipeline Stages
-1. **Environment Setup**: Verify tools (Docker, AWS CLI, kubectl)
-2. **Code Checkout**: Clone repository and verify structure
-3. **Build Images**: Build Docker images in parallel
-4. **Push to ECR**: Tag and push images to AWS ECR
-5. **Deploy to EKS**: Update manifests and deploy to Kubernetes
-6. **Verification**: Verify deployment status
+### Worker
+- `REDIS_HOST`: Redis host (default: redis)
+- `POSTGRES_HOST`: Database host (default: db)
 
-## Infrastructure
+## Development
 
-### AWS Resources
-- **ECR Repository**: `767225687948.dkr.ecr.us-west-2.amazonaws.com/voting-app`
-- **EKS Cluster**: `secure-dev-env-cluster`
-- **Region**: `us-west-2`
+### Prerequisites
+- Docker & Docker Compose
+- OR Kubernetes cluster (for k8s deployment)
 
-### Kubernetes Manifests
-- `k8s/frontend.yaml` - Flask frontend deployment and service
-- `k8s/backend.yaml` - Node.js backend deployment and service  
-- `k8s/worker.yaml` - .NET worker deployment
-- `k8s/database.yaml` - PostgreSQL and Redis deployments
+### Local Development
+```bash
+# Start services
+docker-compose up --build
 
-## Access Points
-- Voting Interface: Frontend LoadBalancer URL
-- Results Display: Backend LoadBalancer URL
+# View logs
+docker-compose logs -f
+
+# Stop services
+docker-compose down
+```
+
+### Building Individual Images
+```bash
+# Frontend
+docker build -t voting-frontend ./frontend
+
+# Backend
+docker build -t voting-backend ./backend
+
+# Worker
+docker build -t voting-worker ./worker
+```
 
 ## Features
 
 - Real-time vote processing
 - Duplicate vote prevention
 - Live results updates
-- Scalable architecture
-- Language diversity (Python, Node.js, C#)
-- Automated CI/CD with Jenkins
-- Container orchestration with Kubernetes
+- Scalable microservices architecture
+- Multi-language implementation (Python, Node.js, C#)
+- Container-ready deployment
+- Kubernetes orchestration support
+
+## Ports
+
+- Frontend: 5000
+- Backend: 4000
+- Redis: 6379
+- PostgreSQL: 5432
+
+## Technology Stack
+
+- **Frontend**: Python 3.9, Flask
+- **Backend**: Node.js 16, Express
+- **Worker**: .NET 6.0
+- **Database**: PostgreSQL 15
+- **Cache**: Redis Alpine
+- **Containerization**: Docker
+- **Orchestration**: Kubernetes

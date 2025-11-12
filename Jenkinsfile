@@ -1,256 +1,163 @@
 pipeline {
   agent {
     kubernetes {
-      yaml """
-apiVersion: v1
-kind: Pod
-spec:
-  serviceAccountName: jenkins
-  containers:
-  - name: dind
-    image: docker:24.0-dind
-    securityContext:
-      privileged: true
-    env:
-    - name: DOCKER_TLS_CERTDIR
-      value: ""
-    args:
-    - --insecure-registry=767225687948.dkr.ecr.us-west-2.amazonaws.com
-    - --host=tcp://0.0.0.0:2375
-    volumeMounts:
-    - name: workspace
-      mountPath: /workspace
-    - name: docker-lib
-      mountPath: /var/lib/docker
-    resources:
-      requests:
-        memory: "512Mi"
-        cpu: "500m"
-      limits:
-        memory: "1Gi"
-        cpu: "1000m"
-  volumes:
-  - name: workspace
-    emptyDir: {}
-  - name: docker-lib
-    emptyDir: {}
-"""
+      yamlFile '02-jenkins-dind-pod-template.yaml'
     }
   }
-  
+
   environment {
+    AWS_ACCESS_KEY_ID = credentials('AWS_ACCESS_KEY_ID')
+    AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
     AWS_REGION = 'us-west-2'
     ECR_REGISTRY = '767225687948.dkr.ecr.us-west-2.amazonaws.com'
     ECR_REPO_FRONTEND = 'voting-app-frontend'
     ECR_REPO_BACKEND = 'voting-app-backend'
     ECR_REPO_WORKER = 'voting-app-worker'
-    EKS_CLUSTER = 'infra-env-cluster'
-    NAMESPACE = 'voting-app'
     KUBECONFIG_CREDENTIALS_ID = 'kubeconfig-credentials-id'
   }
-  
+
   stages {
     stage('Checkout') {
-      steps {
-        checkout scm
+      steps { 
+        checkout scm 
       }
     }
-    
+
     stage('Wait for Docker Daemon') {
       steps {
         container('dind') {
           sh '''
-            echo "Waiting for Docker daemon to be ready..."
-            until docker info > /dev/null 2>&1; do
-              sleep 1
-            done
-            echo "✅ Docker daemon is ready!"
-            docker --version
+            echo "Waiting for Docker daemon..."
+            until docker info > /dev/null 2>&1; do sleep 1; done
+            echo "Docker daemon ready"
           '''
         }
       }
     }
-    
-    stage('Setup Tools') {
-      steps {
-        container('dind') {
-          sh '''
-            echo "Installing tools in DinD container..."
-            
-            # Install AWS CLI
-            apk add --no-cache aws-cli curl jq git
 
-            # Install kubectl
-            curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
-            chmod +x kubectl
-            mv kubectl /usr/local/bin/
-            
-            # Verify installations
-            aws --version
-            kubectl version --client
-            git --version
-            echo "✅ All tools installed successfully!"
-          '''
-        }
-      }
-    }
-    
-    stage('AWS & EKS Setup') {
+    stage('Verify Tools') {
       steps {
-        container('dind') {
+        container('jnlp') {
           sh '''
-            echo "Setting up AWS and EKS connection..."
-            
-            # Test AWS connection
-            aws sts get-caller-identity
-            
-            # Update kubeconfig for EKS
-            aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
-            kubectl get nodes
-            
-            echo "✅ AWS and EKS setup complete!"
+            echo "=== Tool Versions ==="
+            kubectl version --client --short || echo "kubectl not found"
+            aws --version || echo "aws cli not found"
+            docker --version || echo "docker not found"
+            helm version --short || echo "helm not found"
           '''
         }
       }
     }
-    
-    stage('Copy Source Code') {
-      steps {
-        container('dind') {
-          sh '''
-            echo "Copying source code to workspace..."
-            cp -r . /workspace/
-            cd /workspace
-            ls -la
-            echo "✅ Source code copied successfully!"
-          '''
-        }
-      }
-    }
-    
+
     stage('ECR Login') {
       steps {
         container('dind') {
           sh '''
             echo "Logging into ECR..."
             aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
-            echo "✅ ECR login successful!"
           '''
         }
       }
     }
-    
+
     stage('Build & Push Frontend') {
       steps {
         container('dind') {
-          sh '''
-            echo "Building Frontend (Flask App)..."
-            cd /workspace/frontend
-            DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_FRONTEND:latest .
-            docker tag $ECR_REPO_FRONTEND:latest $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
-            docker push $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
-            echo "✅ Frontend image pushed successfully!"
-          '''
+          dir('frontend') {
+            sh '''
+              echo "Building Frontend..."
+              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_FRONTEND:latest .
+              docker tag $ECR_REPO_FRONTEND:latest $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
+              docker push $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
+              echo "Frontend pushed successfully"
+            '''
+          }
         }
       }
     }
-    
+
     stage('Build & Push Backend') {
       steps {
         container('dind') {
-          sh '''
-            echo "Building Backend (Node.js App)..."
-            cd /workspace/backend
-            DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_BACKEND:latest .
-            docker tag $ECR_REPO_BACKEND:latest $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
-            docker push $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
-            echo "✅ Backend image pushed successfully!"
-          '''
+          dir('backend') {
+            sh '''
+              echo "Building Backend..."
+              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_BACKEND:latest .
+              docker tag $ECR_REPO_BACKEND:latest $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
+              docker push $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
+              echo "Backend pushed successfully"
+            '''
+          }
         }
       }
     }
-    
+
     stage('Build & Push Worker') {
       steps {
         container('dind') {
-          sh '''
-            echo "Building Worker (.NET App)..."
-            cd /workspace/worker
-            DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_WORKER:latest .
-            docker tag $ECR_REPO_WORKER:latest $ECR_REGISTRY/$ECR_REPO_WORKER:latest
-            docker push $ECR_REGISTRY/$ECR_REPO_WORKER:latest
-            echo "✅ Worker image pushed successfully!"
-          '''
+          dir('worker') {
+            sh '''
+              echo "Building Worker..."
+              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_WORKER:latest .
+              docker tag $ECR_REPO_WORKER:latest $ECR_REGISTRY/$ECR_REPO_WORKER:latest
+              docker push $ECR_REGISTRY/$ECR_REPO_WORKER:latest
+              echo "Worker pushed successfully"
+            '''
+          }
         }
       }
     }
-    
+
     stage('Deploy to EKS') {
       steps {
-        container('dind') {
+        container('jnlp') {
           withCredentials([file(credentialsId: env.KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG')]) {
             sh '''
-              echo "Deploying to EKS with custom images..."
-              
-              # Setup kubeconfig
+              echo "Setting up kubectl..."
+              mkdir -p ~/.kube
+              cat $KUBECONFIG > ~/.kube/config
+              chmod 600 ~/.kube/config
+
+              echo "Deploying to Kubernetes..."
+              kubectl apply -f k8s/postgres.yaml
+              kubectl apply -f k8s/redis.yaml
+              kubectl apply -f k8s/backend.yaml
+              kubectl apply -f k8s/frontend.yaml
+              kubectl apply -f k8s/worker.yaml
+
+              echo "Restarting deployments to pick latest images..."
+              kubectl rollout restart deployment frontend backend worker db redis || true
+              kubectl rollout status deployment frontend --timeout=300s || true
+              kubectl rollout status deployment backend --timeout=300s || true
+              kubectl rollout status deployment worker --timeout=300s || true
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Check Application Status') {
+      steps {
+        container('jnlp') {
+          withCredentials([file(credentialsId: env.KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG')]) {
+            sh '''
               mkdir -p ~/.kube
               cat $KUBECONFIG > ~/.kube/config
               chmod 600 ~/.kube/config
               
-              cd /workspace
-              
-              # Create namespace
-              kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
-              
-              # Deploy infrastructure first
-              echo "Deploying infrastructure..."
-              kubectl apply -f k8s/redis.yaml -n $NAMESPACE
-              kubectl apply -f k8s/postgres.yaml -n $NAMESPACE
-              
-              # Wait for infrastructure
-              echo "Waiting for infrastructure..."
-              kubectl wait --for=condition=available --timeout=300s deployment/redis -n $NAMESPACE || true
-              kubectl wait --for=condition=available --timeout=300s deployment/db -n $NAMESPACE || true
-              
-              # Deploy applications
-              echo "Deploying applications..."
-              kubectl apply -f k8s/frontend.yaml -n $NAMESPACE
-              kubectl apply -f k8s/backend.yaml -n $NAMESPACE
-              kubectl apply -f k8s/worker.yaml -n $NAMESPACE
-              
-              # Force restart to pull latest images
-              echo "Restarting deployments with latest images..."
-              kubectl rollout restart deployment/frontend -n $NAMESPACE
-              kubectl rollout restart deployment/backend -n $NAMESPACE
-              kubectl rollout restart deployment/worker -n $NAMESPACE
-              
-              # Wait for rollouts
-              echo "Waiting for rollouts to complete..."
-              kubectl rollout status deployment/frontend -n $NAMESPACE --timeout=300s
-              kubectl rollout status deployment/backend -n $NAMESPACE --timeout=300s
-              kubectl rollout status deployment/worker -n $NAMESPACE --timeout=300s
-              
-              echo "✅ All deployments completed successfully!"
-              
-              # Show final status
-              echo "=== Final Deployment Status ==="
-              kubectl get pods -n $NAMESPACE
-              kubectl get svc -n $NAMESPACE
-              
-              echo ""
-              echo "=== LoadBalancer URLs ==="
-              echo "Frontend URL:"
-              kubectl get svc frontend -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "Pending..."
-              echo ""
-              echo "Backend URL:"
-              kubectl get svc backend -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "Pending..."
+              echo "=== DEPLOYMENTS ==="
+              kubectl get deploy
+              echo "=== PODS ==="
+              kubectl get pods
+              echo "=== SERVICES ==="
+              kubectl get svc
             '''
           }
         }
       }
     }
   }
-  
+
   post {
     always {
       container('dind') {
@@ -259,36 +166,14 @@ spec:
           docker rmi $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest || true
           docker rmi $ECR_REGISTRY/$ECR_REPO_BACKEND:latest || true
           docker rmi $ECR_REGISTRY/$ECR_REPO_WORKER:latest || true
-          docker rmi $ECR_REPO_FRONTEND:latest || true
-          docker rmi $ECR_REPO_BACKEND:latest || true
-          docker rmi $ECR_REPO_WORKER:latest || true
-          docker system prune -f || true
         '''
       }
     }
-    success {
-      echo '''
-        🎉 =================================="
-        ✅ PURE DIND PIPELINE SUCCESS!"
-        =================================="
-        
-        🎯 Custom Images Built & Deployed:"
-        • Frontend: Flask voting app"
-        • Backend: Node.js results app"
-        • Worker: .NET vote processor"
-        
-        🚀 All images pushed to ECR and deployed to EKS!"
-        
-        📱 Access your application:"
-        kubectl get svc -n voting-app"
-        
-        💡 Your custom code is now running in production!"
-        
-        🔥 Pure Docker-in-Docker approach - NO JNLP!"
-      '''
+    success { 
+      echo 'Pipeline completed successfully!' 
     }
-    failure {
-      echo '❌ Pure DinD pipeline failed! Check logs for details.'
+    failure { 
+      echo 'Pipeline failed. Check logs for details.' 
     }
   }
 }
