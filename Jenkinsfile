@@ -1,37 +1,7 @@
 pipeline {
   agent {
     kubernetes {
-      yaml """
-apiVersion: v1
-kind: Pod
-spec:
-  serviceAccountName: jenkins
-  containers:
-  - name: jnlp
-    image: jenkins/inbound-agent:latest
-  - name: kaniko
-    image: gcr.io/kaniko-project/executor:debug
-    command: ["/busybox/cat"]
-    tty: true
-    volumeMounts:
-    - name: docker-config
-      mountPath: /kaniko/.docker
-  - name: kubectl
-    image: bitnami/kubectl:latest
-    command: ["cat"]
-    tty: true
-  - name: aws-cli
-    image: amazon/aws-cli:latest
-    command: ["cat"]  
-    tty: true
-  volumes:
-  - name: docker-config
-    secret:
-      secretName: ecr-credentials
-      items:
-      - key: .dockerconfigjson
-        path: config.json
-"""
+      yamlFile 'jenkins-custom-agent.yaml'
     }
   }
   
@@ -46,17 +16,22 @@ spec:
   stages {
     stage('🔍 Environment Setup') {
       steps {
-        container('aws-cli') {
+        container('jnlp') {
           sh '''
-            echo "=== Environment Information ==="
+            echo "=== Custom Jenkins Agent Environment ==="
             echo "AWS Region: ${AWS_REGION}"
             echo "ECR Registry: ${ECR_REGISTRY}"
             echo "EKS Cluster: ${EKS_CLUSTER}"
             echo "Commit ID: ${COMMIT_ID}"
             echo "Namespace: ${NAMESPACE}"
+            echo ""
             
+            echo "=== Tool Verification ==="
             aws --version
-            echo "✅ Environment ready!"
+            kubectl version --client
+            docker --version
+            git --version
+            echo "✅ All tools ready in custom image!"
           '''
         }
       }
@@ -64,16 +39,13 @@ spec:
     
     stage('🔧 AWS & Kubernetes Setup') {
       steps {
-        container('aws-cli') {
+        container('jnlp') {
           sh '''
             echo "=== AWS Configuration ==="
             aws sts get-caller-identity
-            aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
-          '''
-        }
-        container('kubectl') {
-          sh '''
+            
             echo "=== Kubernetes Configuration ==="
+            aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
             kubectl get nodes
             echo "✅ Cluster connection verified!"
           '''
@@ -81,55 +53,101 @@ spec:
       }
     }
     
-    stage('📦 Build Custom Images with Kaniko') {
+    stage('🐳 Docker Service Setup') {
+      steps {
+        container('jnlp') {
+          sh '''
+            echo "=== Docker Service Setup ==="
+            # Start Docker daemon if needed
+            sudo service docker start || echo "Docker already running"
+            
+            # Wait for Docker to be ready
+            for i in {1..30}; do
+              if docker info >/dev/null 2>&1; then
+                echo "✅ Docker is ready!"
+                break
+              fi
+              echo "Waiting for Docker... ($i/30)"
+              sleep 2
+            done
+            
+            docker --version
+            docker info
+          '''
+        }
+      }
+    }
+    
+    stage('📦 Build Custom Images') {
       parallel {
-        stage('🗳️ Build Frontend') {
+        stage('🗳️ Frontend Service') {
           steps {
-            container('kaniko') {
-              sh """
+            container('jnlp') {
+              sh '''
                 echo "=== Building Frontend Image (Your Flask App) ==="
-                /kaniko/executor \\
-                  --context=\${WORKSPACE}/frontend \\
-                  --dockerfile=\${WORKSPACE}/frontend/Dockerfile \\
-                  --destination=${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} \\
-                  --destination=${ECR_REGISTRY}/voting-app-frontend:latest \\
-                  --cache=true
-                echo "✅ Frontend image built and pushed!"
-              """
+                
+                # ECR Login
+                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                
+                # Build image
+                cd frontend
+                docker build -t ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} .
+                docker tag ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-frontend:latest
+                
+                # Push image
+                docker push ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID}
+                docker push ${ECR_REGISTRY}/voting-app-frontend:latest
+                
+                echo "✅ Frontend image (your Flask app) pushed successfully!"
+              '''
             }
           }
         }
         
-        stage('📊 Build Backend') {
+        stage('📊 Backend Service') {
           steps {
-            container('kaniko') {
-              sh """
+            container('jnlp') {
+              sh '''
                 echo "=== Building Backend Image (Your Node.js App) ==="
-                /kaniko/executor \\
-                  --context=\${WORKSPACE}/backend \\
-                  --dockerfile=\${WORKSPACE}/backend/Dockerfile \\
-                  --destination=${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} \\
-                  --destination=${ECR_REGISTRY}/voting-app-backend:latest \\
-                  --cache=true
-                echo "✅ Backend image built and pushed!"
-              """
+                
+                # ECR Login
+                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                
+                # Build image
+                cd backend
+                docker build -t ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} .
+                docker tag ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-backend:latest
+                
+                # Push image
+                docker push ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID}
+                docker push ${ECR_REGISTRY}/voting-app-backend:latest
+                
+                echo "✅ Backend image (your Node.js app) pushed successfully!"
+              '''
             }
           }
         }
         
-        stage('⚙️ Build Worker') {
+        stage('⚙️ Worker Service') {
           steps {
-            container('kaniko') {
-              sh """
+            container('jnlp') {
+              sh '''
                 echo "=== Building Worker Image (Your .NET App) ==="
-                /kaniko/executor \\
-                  --context=\${WORKSPACE}/worker \\
-                  --dockerfile=\${WORKSPACE}/worker/Dockerfile \\
-                  --destination=${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} \\
-                  --destination=${ECR_REGISTRY}/voting-app-worker:latest \\
-                  --cache=true
-                echo "✅ Worker image built and pushed!"
-              """
+                
+                # ECR Login
+                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                
+                # Build image
+                cd worker
+                docker build -t ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} .
+                docker tag ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-worker:latest
+                
+                # Push image
+                docker push ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID}
+                docker push ${ECR_REGISTRY}/voting-app-worker:latest
+                
+                echo "✅ Worker image (your .NET app) pushed successfully!"
+              '''
             }
           }
         }
@@ -138,7 +156,7 @@ spec:
     
     stage('✅ Verify Custom Images') {
       steps {
-        container('aws-cli') {
+        container('jnlp') {
           sh '''
             echo "=== Verifying Custom Images in ECR ==="
             
@@ -169,9 +187,9 @@ spec:
       }
     }
     
-    stage('🚀 Deploy Custom Images to EKS') {
+    stage('🚀 Deploy to EKS') {
       steps {
-        container('kubectl') {
+        container('jnlp') {
           sh '''
             echo "=== Deploying Custom Images to EKS ==="
             
@@ -183,7 +201,7 @@ spec:
             kubectl apply -f k8s/redis.yaml -n ${NAMESPACE}
             kubectl apply -f k8s/postgres.yaml -n ${NAMESPACE}
             
-            # Deploy applications with custom images
+            # Deploy applications
             echo "Deploying applications with custom images..."
             kubectl apply -f k8s/frontend.yaml -n ${NAMESPACE}
             kubectl apply -f k8s/backend.yaml -n ${NAMESPACE}
@@ -234,11 +252,11 @@ spec:
       =================================="
       
       🎯 Custom Images Built & Deployed:"
-      • Frontend: Your Flask voting app"
-      • Backend: Your Node.js results app"
-      • Worker: Your .NET vote processor"
+      • Frontend: Your Flask voting app (${COMMIT_ID})"
+      • Backend: Your Node.js results app (${COMMIT_ID})"
+      • Worker: Your .NET vote processor (${COMMIT_ID})"
       
-      🚀 Commit: ${COMMIT_ID}"
+      🚀 All images pushed to ECR and deployed to EKS!"
       🌐 Namespace: ${NAMESPACE}"
       
       📱 Access your CUSTOM voting app:"
@@ -251,7 +269,13 @@ spec:
       echo '❌ Custom image pipeline failed! Check logs.'
     }
     always {
-      echo '🏁 Custom image pipeline finished.'
+      container('jnlp') {
+        sh '''
+          # Cleanup Docker images to save space
+          docker system prune -af || true
+          echo "🏁 Custom image pipeline finished."
+        '''
+      }
     }
   }
 }
