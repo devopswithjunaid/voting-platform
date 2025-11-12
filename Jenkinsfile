@@ -1,46 +1,5 @@
 pipeline {
-  agent {
-    kubernetes {
-      yaml """
-apiVersion: v1
-kind: Pod
-spec:
-  serviceAccountName: jenkins
-  containers:
-  - name: shell
-    image: devopswithjunaid/jenkins-agent-with-tools:latest
-    command: ["/bin/bash"]
-    args: ["-c", "while true; do sleep 30; done"]
-    tty: true
-    env:
-    - name: DOCKER_HOST
-      value: tcp://dind:2375
-    volumeMounts:
-    - name: workspace
-      mountPath: /workspace
-  - name: dind
-    image: docker:24.0-dind
-    securityContext:
-      privileged: true
-    env:
-    - name: DOCKER_TLS_CERTDIR
-      value: ""
-    args:
-    - --insecure-registry=767225687948.dkr.ecr.us-west-2.amazonaws.com
-    - --host=tcp://0.0.0.0:2375
-    volumeMounts:
-    - name: workspace
-      mountPath: /workspace
-    - name: docker-lib
-      mountPath: /var/lib/docker
-  volumes:
-  - name: workspace
-    emptyDir: {}
-  - name: docker-lib
-    emptyDir: {}
-"""
-    }
-  }
+  agent any
   
   environment {
     AWS_REGION = 'us-west-2'
@@ -48,157 +7,183 @@ spec:
     EKS_CLUSTER = 'infra-env-cluster'
     NAMESPACE = 'voting-app'
     COMMIT_ID = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+    
+    // Static pod name
+    STATIC_POD = 'jenkins-static-agent'
+    KUBECTL_PATH = '/var/jenkins_home/kubectl'
+    AWS_PATH = '/var/jenkins_home/aws/dist/aws'
   }
   
   stages {
     stage('🔍 Environment Setup') {
       steps {
-        container('shell') {
-          sh '''
-            echo "=== Static Pod Environment ==="
-            echo "AWS Region: ${AWS_REGION}"
-            echo "ECR Registry: ${ECR_REGISTRY}"
-            echo "EKS Cluster: ${EKS_CLUSTER}"
-            echo "Commit ID: ${COMMIT_ID}"
-            echo "Namespace: ${NAMESPACE}"
-            echo ""
-            
-            echo "=== Tool Verification ==="
-            aws --version
-            kubectl version --client
-            git --version
-            echo "✅ All tools ready!"
-          '''
-        }
+        sh '''
+          echo "=== Using Static Pod Execution ==="
+          echo "AWS Region: ${AWS_REGION}"
+          echo "ECR Registry: ${ECR_REGISTRY}"
+          echo "EKS Cluster: ${EKS_CLUSTER}"
+          echo "Commit ID: ${COMMIT_ID}"
+          echo "Namespace: ${NAMESPACE}"
+          echo "Static Pod: ${STATIC_POD}"
+          echo ""
+          
+          echo "=== Checking Static Pod ==="
+          ${KUBECTL_PATH} get pod ${STATIC_POD} -n jenkins
+          echo "✅ Static pod ready!"
+        '''
       }
     }
     
-    stage('🐳 Wait for Docker') {
+    stage('🐳 Setup Docker in Static Pod') {
       steps {
-        container('shell') {
-          sh '''
-            echo "=== Waiting for Docker Daemon ==="
+        sh '''
+          echo "=== Setting up Docker in Static Pod ==="
+          
+          # Wait for Docker daemon in static pod
+          ${KUBECTL_PATH} exec ${STATIC_POD} -n jenkins -c jenkins-agent -- bash -c "
+            echo 'Waiting for Docker daemon...'
             for i in {1..60}; do
               if docker info >/dev/null 2>&1; then
-                echo "✅ Docker daemon is ready!"
+                echo '✅ Docker daemon ready!'
                 break
               fi
-              echo "Waiting for Docker daemon... ($i/60)"
+              echo 'Waiting... (\$i/60)'
               sleep 2
             done
             docker --version
-          '''
-        }
+          "
+        '''
       }
     }
     
     stage('🔧 AWS & Kubernetes Setup') {
       steps {
-        container('shell') {
-          sh '''
-            echo "=== AWS Configuration ==="
+        sh '''
+          echo "=== AWS & Kubernetes Setup in Static Pod ==="
+          
+          ${KUBECTL_PATH} exec ${STATIC_POD} -n jenkins -c jenkins-agent -- bash -c "
+            echo '=== AWS Configuration ==='
             aws sts get-caller-identity
             
-            echo "=== Kubernetes Configuration ==="
+            echo '=== Kubernetes Configuration ==='
             aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
             kubectl get nodes
-            echo "✅ Cluster connection verified!"
-          '''
-        }
+            echo '✅ Cluster connection verified!'
+          "
+        '''
+      }
+    }
+    
+    stage('📥 Copy Source Code') {
+      steps {
+        sh '''
+          echo "=== Copying Source Code to Static Pod ==="
+          
+          # Copy entire workspace to static pod
+          ${KUBECTL_PATH} cp . jenkins/${STATIC_POD}:/workspace/ -c jenkins-agent
+          
+          ${KUBECTL_PATH} exec ${STATIC_POD} -n jenkins -c jenkins-agent -- bash -c "
+            cd /workspace
+            ls -la
+            echo '✅ Source code copied!'
+          "
+        '''
       }
     }
     
     stage('🔐 ECR Login') {
       steps {
-        container('shell') {
-          sh '''
-            echo "=== ECR Login ==="
+        sh '''
+          echo "=== ECR Login in Static Pod ==="
+          
+          ${KUBECTL_PATH} exec ${STATIC_POD} -n jenkins -c jenkins-agent -- bash -c "
             aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-            echo "✅ ECR login successful!"
-          '''
-        }
+            echo '✅ ECR login successful!'
+          "
+        '''
       }
     }
     
-    stage('📦 Build Custom Images') {
-      parallel {
-        stage('🗳️ Frontend') {
-          steps {
-            container('shell') {
-              sh '''
-                echo "=== Building Frontend (Your Flask App) ==="
-                cd frontend
-                docker build -t ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} .
-                docker tag ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-frontend:latest
-                
-                docker push ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID}
-                docker push ${ECR_REGISTRY}/voting-app-frontend:latest
-                
-                echo "✅ Frontend image pushed!"
-              '''
-            }
-          }
-        }
-        
-        stage('📊 Backend') {
-          steps {
-            container('shell') {
-              sh '''
-                echo "=== Building Backend (Your Node.js App) ==="
-                cd backend
-                docker build -t ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} .
-                docker tag ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-backend:latest
-                
-                docker push ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID}
-                docker push ${ECR_REGISTRY}/voting-app-backend:latest
-                
-                echo "✅ Backend image pushed!"
-              '''
-            }
-          }
-        }
-        
-        stage('⚙️ Worker') {
-          steps {
-            container('shell') {
-              sh '''
-                echo "=== Building Worker (Your .NET App) ==="
-                cd worker
-                docker build -t ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} .
-                docker tag ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-worker:latest
-                
-                docker push ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID}
-                docker push ${ECR_REGISTRY}/voting-app-worker:latest
-                
-                echo "✅ Worker image pushed!"
-              '''
-            }
-          }
-        }
+    stage('📦 Build Frontend Image') {
+      steps {
+        sh '''
+          echo "=== Building Frontend Image (Your Flask App) ==="
+          
+          ${KUBECTL_PATH} exec ${STATIC_POD} -n jenkins -c jenkins-agent -- bash -c "
+            cd /workspace/frontend
+            docker build -t ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} .
+            docker tag ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-frontend:latest
+            
+            docker push ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID}
+            docker push ${ECR_REGISTRY}/voting-app-frontend:latest
+            
+            echo '✅ Frontend image (Flask app) pushed!'
+          "
+        '''
+      }
+    }
+    
+    stage('📦 Build Backend Image') {
+      steps {
+        sh '''
+          echo "=== Building Backend Image (Your Node.js App) ==="
+          
+          ${KUBECTL_PATH} exec ${STATIC_POD} -n jenkins -c jenkins-agent -- bash -c "
+            cd /workspace/backend
+            docker build -t ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} .
+            docker tag ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-backend:latest
+            
+            docker push ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID}
+            docker push ${ECR_REGISTRY}/voting-app-backend:latest
+            
+            echo '✅ Backend image (Node.js app) pushed!'
+          "
+        '''
+      }
+    }
+    
+    stage('📦 Build Worker Image') {
+      steps {
+        sh '''
+          echo "=== Building Worker Image (Your .NET App) ==="
+          
+          ${KUBECTL_PATH} exec ${STATIC_POD} -n jenkins -c jenkins-agent -- bash -c "
+            cd /workspace/worker
+            docker build -t ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} .
+            docker tag ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-worker:latest
+            
+            docker push ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID}
+            docker push ${ECR_REGISTRY}/voting-app-worker:latest
+            
+            echo '✅ Worker image (.NET app) pushed!'
+          "
+        '''
       }
     }
     
     stage('✅ Verify Images') {
       steps {
-        container('shell') {
-          sh '''
-            echo "=== Verifying Custom Images ==="
-            
+        sh '''
+          echo "=== Verifying Custom Images in ECR ==="
+          
+          ${KUBECTL_PATH} exec ${STATIC_POD} -n jenkins -c jenkins-agent -- bash -c "
             aws ecr describe-images --repository-name voting-app-frontend --image-ids imageTag=${COMMIT_ID} --region ${AWS_REGION} --query 'imageDetails[0].imageTags'
             aws ecr describe-images --repository-name voting-app-backend --image-ids imageTag=${COMMIT_ID} --region ${AWS_REGION} --query 'imageDetails[0].imageTags'
             aws ecr describe-images --repository-name voting-app-worker --image-ids imageTag=${COMMIT_ID} --region ${AWS_REGION} --query 'imageDetails[0].imageTags'
             
-            echo "✅ All images verified!"
-          '''
-        }
+            echo '✅ All custom images verified!'
+          "
+        '''
       }
     }
     
     stage('🚀 Deploy to EKS') {
       steps {
-        container('shell') {
-          sh '''
-            echo "=== Deploying to EKS ==="
+        sh '''
+          echo "=== Deploying Custom Images to EKS ==="
+          
+          ${KUBECTL_PATH} exec ${STATIC_POD} -n jenkins -c jenkins-agent -- bash -c "
+            cd /workspace
             
             # Create namespace
             kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
@@ -212,7 +197,7 @@ spec:
             kubectl apply -f k8s/backend.yaml -n ${NAMESPACE}
             kubectl apply -f k8s/worker.yaml -n ${NAMESPACE}
             
-            # Update images
+            # Update to custom images
             kubectl set image deployment/frontend frontend=${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} -n ${NAMESPACE}
             kubectl set image deployment/backend backend=${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} -n ${NAMESPACE}
             kubectl set image deployment/worker worker=${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} -n ${NAMESPACE}
@@ -222,44 +207,53 @@ spec:
             kubectl rollout status deployment/backend -n ${NAMESPACE} --timeout=300s
             kubectl rollout status deployment/worker -n ${NAMESPACE} --timeout=300s
             
-            echo "=== Deployment Complete ==="
+            echo '=== Deployment Complete ==='
             kubectl get pods -n ${NAMESPACE}
             kubectl get svc -n ${NAMESPACE}
             
-            echo "Frontend URL:"
-            kubectl get svc frontend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "Pending..."
-            echo ""
-            echo "Backend URL:"
-            kubectl get svc backend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "Pending..."
-          '''
-        }
+            echo 'Frontend URL:'
+            kubectl get svc frontend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo 'Pending...'
+            echo ''
+            echo 'Backend URL:'
+            kubectl get svc backend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo 'Pending...'
+          "
+        '''
       }
     }
   }
   
   post {
     success {
-      echo '''
-        🎉 =================================="
-        ✅ CUSTOM IMAGES DEPLOYED SUCCESS!"
-        =================================="
-        
-        🎯 Your Custom Apps Deployed:"
-        • Frontend: Flask voting app"
-        • Backend: Node.js results app"
-        • Worker: .NET vote processor"
-        
-        📱 kubectl get svc -n voting-app"
-        🚀 Your voting app is LIVE!"
+      sh '''
+        echo ""
+        echo "🎉 =================================="
+        echo "✅ CUSTOM IMAGES DEPLOYED SUCCESS!"
+        echo "=================================="
+        echo ""
+        echo "🎯 Your Custom Apps Deployed:"
+        echo "• Frontend: Flask voting app (${COMMIT_ID})"
+        echo "• Backend: Node.js results app (${COMMIT_ID})"
+        echo "• Worker: .NET vote processor (${COMMIT_ID})"
+        echo ""
+        echo "📱 Access Commands:"
+        echo "${KUBECTL_PATH} get svc -n voting-app"
+        echo "${KUBECTL_PATH} get pods -n voting-app"
+        echo ""
+        echo "🚀 Your voting app is LIVE with custom images!"
       '''
     }
     failure {
-      echo '❌ Pipeline failed! Check logs.'
+      echo '❌ Pipeline failed! Check logs for details.'
     }
     always {
-      container('shell') {
-        sh 'docker system prune -af || true'
-      }
+      sh '''
+        # Cleanup in static pod
+        ${KUBECTL_PATH} exec ${STATIC_POD} -n jenkins -c jenkins-agent -- bash -c "
+          docker system prune -af || true
+          rm -rf /workspace/* || true
+        " || echo "Cleanup completed"
+        echo "🏁 Pipeline execution finished."
+      '''
     }
   }
 }
