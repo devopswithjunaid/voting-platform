@@ -1,258 +1,264 @@
 pipeline {
-  agent {
-    kubernetes {
-      yamlFile 'jenkins-working-template.yaml'
-    }
-  }
+  agent any
   
   environment {
     AWS_REGION = 'us-west-2'
     ECR_REGISTRY = '767225687948.dkr.ecr.us-west-2.amazonaws.com'
-    ECR_REPO_FRONTEND = 'voting-app-frontend'
-    ECR_REPO_BACKEND = 'voting-app-backend'
-    ECR_REPO_WORKER = 'voting-app-worker'
-    KUBECONFIG_CREDENTIALS_ID = 'kubeconfig-credentials-id'
+    EKS_CLUSTER = 'infra-env-cluster'
+    NAMESPACE = 'voting-app'
+    COMMIT_ID = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+    
+    // Tool paths
+    KUBECTL_PATH = '/var/jenkins_home/kubectl'
+    AWS_PATH = '/var/jenkins_home/aws/dist/aws'
   }
   
   stages {
-    stage('Checkout') {
+    stage('🔍 Environment Setup') {
       steps {
-        checkout scm
+        sh '''
+          echo "=== Direct Execution Approach ==="
+          echo "AWS Region: ${AWS_REGION}"
+          echo "ECR Registry: ${ECR_REGISTRY}"
+          echo "EKS Cluster: ${EKS_CLUSTER}"
+          echo "Commit ID: ${COMMIT_ID}"
+          echo "Namespace: ${NAMESPACE}"
+          
+          # Check executor pod
+          ${KUBECTL_PATH} get deployment jenkins-executor -n jenkins
+          echo "✅ Executor pod ready!"
+        '''
       }
     }
     
-    stage('Wait for Docker Daemon') {
+    stage('🔧 Setup Tools in Executor') {
       steps {
-        container('dind') {
-          sh '''
-            echo "Waiting for Docker daemon to be ready..."
-            until docker info > /dev/null 2>&1; do
-              sleep 1
-            done
-            echo "Docker daemon is ready"
-          '''
-        }
-      }
-    }
-    
-    stage('Setup Tools') {
-      steps {
-        container('dind') {
-          sh '''
-            # Install AWS CLI
-            apk add --no-cache aws-cli curl jq
-
+        sh '''
+          echo "=== Installing Tools in Executor Pod ==="
+          
+          # Get executor pod name
+          EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+          echo "Using executor pod: $EXECUTOR_POD"
+          
+          # Install tools
+          ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+            apk add --no-cache aws-cli curl jq git
+            
             # Install kubectl
-            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            curl -LO 'https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl'
             chmod +x kubectl
             mv kubectl /usr/local/bin/
-          '''
-        }
+            
+            echo 'Tools installed successfully!'
+          "
+        '''
       }
     }
     
-    stage('ECR Login') {
+    stage('📥 Copy Source Code') {
       steps {
-        container('dind') {
+        sh '''
+          echo "=== Copying Source Code ==="
+          
+          EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+          
+          # Copy source code to executor pod
+          ${KUBECTL_PATH} cp . jenkins/$EXECUTOR_POD:/workspace/ -c tools
+          
+          ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+            cd /workspace
+            ls -la
+            echo 'Source code copied successfully!'
+          "
+        '''
+      }
+    }
+    
+    stage('🐳 Setup Docker & AWS') {
+      steps {
+        sh '''
+          echo "=== Setting up Docker & AWS ==="
+          
+          EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+          
+          ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+            # Wait for Docker daemon
+            echo 'Waiting for Docker daemon...'
+            for i in {1..60}; do
+              if docker info >/dev/null 2>&1; then
+                echo 'Docker daemon ready!'
+                break
+              fi
+              sleep 2
+            done
+            
+            # Setup AWS and EKS
+            aws sts get-caller-identity
+            aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
+            kubectl get nodes
+            
+            echo 'Docker & AWS setup complete!'
+          "
+        '''
+      }
+    }
+    
+    stage('🔐 ECR Login & Build Images') {
+      steps {
+        sh '''
+          echo "=== ECR Login & Building Images ==="
+          
+          EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+          
+          ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+            cd /workspace
+            
+            # ECR Login
+            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+            
+            # Build Frontend
+            echo 'Building Frontend...'
+            cd frontend
+            docker build -t ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} .
+            docker tag ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-frontend:latest
+            docker push ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID}
+            docker push ${ECR_REGISTRY}/voting-app-frontend:latest
+            
+            # Build Backend
+            echo 'Building Backend...'
+            cd ../backend
+            docker build -t ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} .
+            docker tag ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-backend:latest
+            docker push ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID}
+            docker push ${ECR_REGISTRY}/voting-app-backend:latest
+            
+            # Build Worker
+            echo 'Building Worker...'
+            cd ../worker
+            docker build -t ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} .
+            docker tag ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-worker:latest
+            docker push ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID}
+            docker push ${ECR_REGISTRY}/voting-app-worker:latest
+            
+            echo 'All images built and pushed successfully!'
+          "
+        '''
+      }
+    }
+    
+    stage('🚀 Deploy to EKS') {
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig-credentials-id', variable: 'KUBECONFIG_FILE')]) {
           sh '''
-            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
-          '''
-        }
-      }
-    }
-    
-    stage('Build & Push Frontend') {
-      steps {
-        container('dind') {
-          dir('frontend') {
-            sh '''
-              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_FRONTEND:latest .
-              docker tag $ECR_REPO_FRONTEND:latest $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
-              docker push $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
-            '''
-          }
-        }
-      }
-    }
-    
-    stage('Build & Push Backend') {
-      steps {
-        container('dind') {
-          dir('backend') {
-            sh '''
-              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_BACKEND:latest .
-              docker tag $ECR_REPO_BACKEND:latest $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
-              docker push $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
-            '''
-          }
-        }
-      }
-    }
-    
-    stage('Build & Push Worker') {
-      steps {
-        container('dind') {
-          dir('worker') {
-            sh '''
-              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_WORKER:latest .
-              docker tag $ECR_REPO_WORKER:latest $ECR_REGISTRY/$ECR_REPO_WORKER:latest
-              docker push $ECR_REGISTRY/$ECR_REPO_WORKER:latest
-            '''
-          }
-        }
-      }
-    }
-    
-    stage('Deploy to EKS') {
-      steps {
-        container('dind') {
-          withCredentials([file(credentialsId: env.KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG')]) {
-            sh '''
+            echo "=== Deploying to EKS ==="
+            
+            EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+            
+            # Copy kubeconfig to executor pod
+            ${KUBECTL_PATH} cp $KUBECONFIG_FILE jenkins/$EXECUTOR_POD:/tmp/kubeconfig -c tools
+            
+            ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+              cd /workspace
+              
               # Setup kubeconfig
               mkdir -p ~/.kube
-              cat $KUBECONFIG > ~/.kube/config
+              cp /tmp/kubeconfig ~/.kube/config
               chmod 600 ~/.kube/config
               
-              # Create namespace if it doesn't exist
-              kubectl create namespace voting-app --dry-run=client -o yaml | kubectl apply -f -
+              # Create namespace
+              kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
               
-              # Apply infrastructure first (Redis, PostgreSQL)
-              echo "Deploying infrastructure..."
-              kubectl apply -f k8s/redis.yaml -n voting-app
-              kubectl apply -f k8s/postgres.yaml -n voting-app
+              # Deploy infrastructure
+              echo 'Deploying infrastructure...'
+              kubectl apply -f k8s/redis.yaml -n ${NAMESPACE}
+              kubectl apply -f k8s/postgres.yaml -n ${NAMESPACE}
               
-              # Wait for infrastructure to be ready
-              echo "Waiting for infrastructure..."
-              kubectl wait --for=condition=available --timeout=300s deployment/redis -n voting-app || true
-              kubectl wait --for=condition=available --timeout=300s deployment/db -n voting-app || true
+              # Deploy applications
+              echo 'Deploying applications...'
+              kubectl apply -f k8s/frontend.yaml -n ${NAMESPACE}
+              kubectl apply -f k8s/backend.yaml -n ${NAMESPACE}
+              kubectl apply -f k8s/worker.yaml -n ${NAMESPACE}
               
-              # Apply application deployments
-              echo "Deploying applications..."
-              kubectl apply -f k8s/frontend.yaml -n voting-app
-              kubectl apply -f k8s/backend.yaml -n voting-app
-              kubectl apply -f k8s/worker.yaml -n voting-app
+              # Update to custom images
+              kubectl set image deployment/frontend frontend=${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} -n ${NAMESPACE}
+              kubectl set image deployment/backend backend=${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} -n ${NAMESPACE}
+              kubectl set image deployment/worker worker=${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} -n ${NAMESPACE}
               
-              # Force restart all deployments to pull latest images
-              echo "Forcing all deployments to pull latest images..."
-              kubectl rollout restart deployment/frontend -n voting-app
-              kubectl rollout restart deployment/backend -n voting-app
-              kubectl rollout restart deployment/worker -n voting-app
+              # Wait for rollout
+              kubectl rollout status deployment/frontend -n ${NAMESPACE} --timeout=300s
+              kubectl rollout status deployment/backend -n ${NAMESPACE} --timeout=300s
+              kubectl rollout status deployment/worker -n ${NAMESPACE} --timeout=300s
               
-              # Wait for all rollouts to complete
-              echo "Waiting for frontend rollout to complete..."
-              kubectl rollout status deployment/frontend -n voting-app --timeout=300s
-              echo "Waiting for backend rollout to complete..."
-              kubectl rollout status deployment/backend -n voting-app --timeout=300s
-              echo "Waiting for worker rollout to complete..."
-              kubectl rollout status deployment/worker -n voting-app --timeout=300s
-              
-              echo "All deployments restarted successfully!"
-              
-              # Wait for deployments (final check)
-              echo "Final deployment status check..."
-              kubectl rollout status deployment/frontend -n voting-app || true
-              kubectl rollout status deployment/backend -n voting-app || true
-              kubectl rollout status deployment/worker -n voting-app || true
-            '''
-          }
+              echo 'Deployment complete!'
+              kubectl get pods -n ${NAMESPACE}
+              kubectl get svc -n ${NAMESPACE}
+            "
+          '''
         }
       }
     }
     
-    stage('Check Application Status') {
+    stage('✅ Verify Deployment') {
       steps {
-        container('dind') {
-          withCredentials([file(credentialsId: env.KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG')]) {
-            script {
-              sh '''
-                # Setup kubeconfig
-                mkdir -p ~/.kube
-                cat $KUBECONFIG > ~/.kube/config
-                chmod 600 ~/.kube/config
-                
-                # Check deployment status
-                echo "=== DEPLOYMENT STATUS ===" > app_status.txt
-                
-                # Frontend Status
-                FRONTEND_STATUS=$(kubectl get deployment frontend -n voting-app -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
-                FRONTEND_READY=$(kubectl get deployment frontend -n voting-app -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-                FRONTEND_DESIRED=$(kubectl get deployment frontend -n voting-app -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
-                
-                echo "Frontend: $FRONTEND_STATUS ($FRONTEND_READY/$FRONTEND_DESIRED ready)" >> app_status.txt
-                
-                # Backend Status
-                BACKEND_STATUS=$(kubectl get deployment backend -n voting-app -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
-                BACKEND_READY=$(kubectl get deployment backend -n voting-app -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-                BACKEND_DESIRED=$(kubectl get deployment backend -n voting-app -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
-                
-                echo "Backend: $BACKEND_STATUS ($BACKEND_READY/$BACKEND_DESIRED ready)" >> app_status.txt
-                
-                # Worker Status
-                WORKER_STATUS=$(kubectl get deployment worker -n voting-app -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
-                WORKER_READY=$(kubectl get deployment worker -n voting-app -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-                WORKER_DESIRED=$(kubectl get deployment worker -n voting-app -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
-                
-                echo "Worker: $WORKER_STATUS ($WORKER_READY/$WORKER_DESIRED ready)" >> app_status.txt
-                
-                # Overall Status
-                echo "" >> app_status.txt
-                echo "=== PODS STATUS ===" >> app_status.txt
-                kubectl get pods -n voting-app --no-headers | awk '{print $1 ": " $3 " (" $2 ")"}' >> app_status.txt
-                
-                # Service Status
-                echo "" >> app_status.txt
-                echo "=== SERVICES ===" >> app_status.txt
-                kubectl get svc -n voting-app --no-headers | awk '{print $1 ": " $2 " (" $4 ")"}' >> app_status.txt
-                
-                # Overall health check
-                if [ "$FRONTEND_STATUS" = "True" ] && [ "$BACKEND_STATUS" = "True" ] && [ "$WORKER_STATUS" = "True" ]; then
-                  echo "" >> app_status.txt
-                  echo "🟢 Overall Status: HEALTHY - All services running" >> app_status.txt
-                else
-                  echo "" >> app_status.txt
-                  echo "🔴 Overall Status: UNHEALTHY - Some services down" >> app_status.txt
-                fi
-                
-                # Display status
-                cat app_status.txt
-              '''
-            }
-          }
+        withCredentials([file(credentialsId: 'kubeconfig-credentials-id', variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            echo "=== Verifying Deployment ==="
+            
+            EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+            
+            ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+              # Check deployment status
+              kubectl get deployments -n ${NAMESPACE}
+              kubectl get pods -n ${NAMESPACE}
+              kubectl get svc -n ${NAMESPACE}
+              
+              echo 'Frontend URL:'
+              kubectl get svc frontend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo 'Pending...'
+              echo ''
+              echo 'Backend URL:'
+              kubectl get svc backend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo 'Pending...'
+            "
+          '''
         }
       }
     }
   }
   
   post {
-    always {
-      container('dind') {
-        sh '''
-          docker rmi $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest || true
-          docker rmi $ECR_REGISTRY/$ECR_REPO_BACKEND:latest || true
-          docker rmi $ECR_REGISTRY/$ECR_REPO_WORKER:latest || true
-          docker rmi $ECR_REPO_FRONTEND:latest || true
-          docker rmi $ECR_REPO_BACKEND:latest || true
-          docker rmi $ECR_REPO_WORKER:latest || true
-        '''
-      }
-    }
     success {
-      echo '''
-        🎉 =================================="
-        ✅ PIPELINE COMPLETED SUCCESSFULLY!"
-        =================================="
-        
-        🎯 All custom images built and deployed!"
-        🌐 Namespace: voting-app"
-        
-        📱 Access your application:"
-        - kubectl get svc -n voting-app"
-        
-        🚀 Your voting app is now live!"
+      sh '''
+        echo ""
+        echo "🎉 =================================="
+        echo "✅ CUSTOM IMAGES DEPLOYED SUCCESS!"
+        echo "=================================="
+        echo ""
+        echo "🎯 Custom Images Built & Deployed:"
+        echo "• Frontend: Flask voting app (${COMMIT_ID})"
+        echo "• Backend: Node.js results app (${COMMIT_ID})"
+        echo "• Worker: .NET vote processor (${COMMIT_ID})"
+        echo ""
+        echo "📱 Access Commands:"
+        echo "${KUBECTL_PATH} get svc -n voting-app"
+        echo "${KUBECTL_PATH} get pods -n voting-app"
+        echo ""
+        echo "🚀 Your voting app is LIVE with custom images!"
       '''
     }
     failure {
       echo '❌ Pipeline failed! Check logs for details.'
+    }
+    always {
+      sh '''
+        # Cleanup
+        EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+        if [ ! -z "$EXECUTOR_POD" ]; then
+          ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+            docker system prune -af || true
+            rm -rf /workspace/* || true
+          " 2>/dev/null || echo "Cleanup completed"
+        fi
+        echo "🏁 Pipeline execution finished."
+      '''
     }
   }
 }
