@@ -13,7 +13,8 @@ pipeline {
     ECR_REPO_FRONTEND = 'voting-app-frontend'
     ECR_REPO_BACKEND = 'voting-app-backend'
     ECR_REPO_WORKER = 'voting-app-worker'
-    KUBECONFIG_CREDENTIALS_ID = 'kubeconfig-credentials-id'
+    KUBECONFIG_CREDENTIALS_ID = 'kubeconfig-jenkins-permanent'
+    DOCKER_HOST = 'tcp://localhost:2375'
   }
 
   stages {
@@ -40,10 +41,9 @@ pipeline {
         container('jnlp') {
           sh '''
             echo "=== Tool Versions ==="
-            kubectl version --client --short || echo "kubectl not found"
+            kubectl version --client || echo "kubectl not found"
             aws --version || echo "aws cli not found"
             docker --version || echo "docker not found"
-            helm version --short || echo "helm not found"
           '''
         }
       }
@@ -51,10 +51,18 @@ pipeline {
 
     stage('ECR Login') {
       steps {
-        container('dind') {
+        container('jnlp') {
           sh '''
             echo "Logging into ECR..."
-            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+            aws ecr get-login-password --region $AWS_REGION > /tmp/ecr-token
+            echo "ECR login token generated"
+          '''
+        }
+        container('dind') {
+          sh '''
+            echo "Docker login to ECR..."
+            cat /tmp/ecr-token | docker login --username AWS --password-stdin $ECR_REGISTRY
+            echo "ECR login successful"
           '''
         }
       }
@@ -66,7 +74,7 @@ pipeline {
           dir('frontend') {
             sh '''
               echo "Building Frontend..."
-              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_FRONTEND:latest .
+              docker build -t $ECR_REPO_FRONTEND:latest .
               docker tag $ECR_REPO_FRONTEND:latest $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
               docker push $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
               echo "Frontend pushed successfully"
@@ -82,7 +90,7 @@ pipeline {
           dir('backend') {
             sh '''
               echo "Building Backend..."
-              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_BACKEND:latest .
+              docker build -t $ECR_REPO_BACKEND:latest .
               docker tag $ECR_REPO_BACKEND:latest $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
               docker push $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
               echo "Backend pushed successfully"
@@ -98,7 +106,7 @@ pipeline {
           dir('worker') {
             sh '''
               echo "Building Worker..."
-              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_WORKER:latest .
+              docker build -t $ECR_REPO_WORKER:latest .
               docker tag $ECR_REPO_WORKER:latest $ECR_REGISTRY/$ECR_REPO_WORKER:latest
               docker push $ECR_REGISTRY/$ECR_REPO_WORKER:latest
               echo "Worker pushed successfully"
