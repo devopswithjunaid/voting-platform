@@ -1,7 +1,7 @@
 pipeline {
   agent {
     kubernetes {
-      yamlFile 'jenkins-custom-agent.yaml'
+      yamlFile 'jenkins-dind-custom.yaml'
     }
   }
   
@@ -18,7 +18,7 @@ pipeline {
       steps {
         container('jnlp') {
           sh '''
-            echo "=== Custom Jenkins Agent Environment ==="
+            echo "=== Custom Jenkins Agent with DinD ==="
             echo "AWS Region: ${AWS_REGION}"
             echo "ECR Registry: ${ECR_REGISTRY}"
             echo "EKS Cluster: ${EKS_CLUSTER}"
@@ -29,9 +29,24 @@ pipeline {
             echo "=== Tool Verification ==="
             aws --version
             kubectl version --client
-            docker --version
             git --version
             echo "✅ All tools ready in custom image!"
+          '''
+        }
+      }
+    }
+    
+    stage('🐳 Wait for Docker Daemon') {
+      steps {
+        container('jnlp') {
+          sh '''
+            echo "=== Waiting for Docker Daemon ==="
+            until docker info > /dev/null 2>&1; do
+              echo "Waiting for Docker daemon..."
+              sleep 2
+            done
+            echo "✅ Docker daemon is ready!"
+            docker --version
           '''
         }
       }
@@ -53,48 +68,29 @@ pipeline {
       }
     }
     
-    stage('🐳 Docker Service Setup') {
+    stage('🔐 ECR Login') {
       steps {
         container('jnlp') {
           sh '''
-            echo "=== Docker Service Setup ==="
-            # Start Docker daemon if needed
-            sudo service docker start || echo "Docker already running"
-            
-            # Wait for Docker to be ready
-            for i in {1..30}; do
-              if docker info >/dev/null 2>&1; then
-                echo "✅ Docker is ready!"
-                break
-              fi
-              echo "Waiting for Docker... ($i/30)"
-              sleep 2
-            done
-            
-            docker --version
-            docker info
+            echo "=== ECR Login ==="
+            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+            echo "✅ ECR login successful!"
           '''
         }
       }
     }
     
-    stage('📦 Build Custom Images') {
+    stage('📦 Build & Push Custom Images') {
       parallel {
         stage('🗳️ Frontend Service') {
           steps {
             container('jnlp') {
               sh '''
                 echo "=== Building Frontend Image (Your Flask App) ==="
-                
-                # ECR Login
-                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                
-                # Build image
                 cd frontend
                 docker build -t ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} .
                 docker tag ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-frontend:latest
                 
-                # Push image
                 docker push ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID}
                 docker push ${ECR_REGISTRY}/voting-app-frontend:latest
                 
@@ -109,16 +105,10 @@ pipeline {
             container('jnlp') {
               sh '''
                 echo "=== Building Backend Image (Your Node.js App) ==="
-                
-                # ECR Login
-                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                
-                # Build image
                 cd backend
                 docker build -t ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} .
                 docker tag ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-backend:latest
                 
-                # Push image
                 docker push ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID}
                 docker push ${ECR_REGISTRY}/voting-app-backend:latest
                 
@@ -133,16 +123,10 @@ pipeline {
             container('jnlp') {
               sh '''
                 echo "=== Building Worker Image (Your .NET App) ==="
-                
-                # ECR Login
-                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                
-                # Build image
                 cd worker
                 docker build -t ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} .
                 docker tag ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-worker:latest
                 
-                # Push image
                 docker push ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID}
                 docker push ${ECR_REGISTRY}/voting-app-worker:latest
                 
@@ -196,10 +180,15 @@ pipeline {
             # Create namespace
             kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
             
-            # Deploy infrastructure
+            # Deploy infrastructure first
             echo "Deploying infrastructure..."
             kubectl apply -f k8s/redis.yaml -n ${NAMESPACE}
             kubectl apply -f k8s/postgres.yaml -n ${NAMESPACE}
+            
+            # Wait for infrastructure
+            echo "Waiting for infrastructure..."
+            kubectl wait --for=condition=available --timeout=300s deployment/redis -n ${NAMESPACE} || true
+            kubectl wait --for=condition=available --timeout=300s deployment/db -n ${NAMESPACE} || true
             
             # Deploy applications
             echo "Deploying applications with custom images..."
@@ -242,40 +231,94 @@ pipeline {
         }
       }
     }
+    
+    stage('📊 Application Status') {
+      steps {
+        container('jnlp') {
+          script {
+            sh '''
+              # Check deployment status
+              echo "=== DEPLOYMENT STATUS ===" > app_status.txt
+              
+              # Frontend Status
+              FRONTEND_STATUS=$(kubectl get deployment frontend -n ${NAMESPACE} -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
+              FRONTEND_READY=$(kubectl get deployment frontend -n ${NAMESPACE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+              FRONTEND_DESIRED=$(kubectl get deployment frontend -n ${NAMESPACE} -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+              
+              echo "Frontend: $FRONTEND_STATUS ($FRONTEND_READY/$FRONTEND_DESIRED ready)" >> app_status.txt
+              
+              # Backend Status
+              BACKEND_STATUS=$(kubectl get deployment backend -n ${NAMESPACE} -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
+              BACKEND_READY=$(kubectl get deployment backend -n ${NAMESPACE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+              BACKEND_DESIRED=$(kubectl get deployment backend -n ${NAMESPACE} -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+              
+              echo "Backend: $BACKEND_STATUS ($BACKEND_READY/$BACKEND_DESIRED ready)" >> app_status.txt
+              
+              # Worker Status
+              WORKER_STATUS=$(kubectl get deployment worker -n ${NAMESPACE} -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
+              WORKER_READY=$(kubectl get deployment worker -n ${NAMESPACE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+              WORKER_DESIRED=$(kubectl get deployment worker -n ${NAMESPACE} -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+              
+              echo "Worker: $WORKER_STATUS ($WORKER_READY/$WORKER_DESIRED ready)" >> app_status.txt
+              
+              # Overall Status
+              echo "" >> app_status.txt
+              echo "=== PODS STATUS ===" >> app_status.txt
+              kubectl get pods -n ${NAMESPACE} --no-headers | awk '{print $1 ": " $3 " (" $2 ")"}' >> app_status.txt
+              
+              # Service Status
+              echo "" >> app_status.txt
+              echo "=== SERVICES ===" >> app_status.txt
+              kubectl get svc -n ${NAMESPACE} --no-headers | awk '{print $1 ": " $2 " (" $4 ")"}' >> app_status.txt
+              
+              # Overall health check
+              if [ "$FRONTEND_STATUS" = "True" ] && [ "$BACKEND_STATUS" = "True" ] && [ "$WORKER_STATUS" = "True" ]; then
+                echo "" >> app_status.txt
+                echo "🟢 Overall Status: HEALTHY - All services running" >> app_status.txt
+              else
+                echo "" >> app_status.txt
+                echo "🟡 Overall Status: DEPLOYING - Some services starting" >> app_status.txt
+              fi
+              
+              # Display status
+              cat app_status.txt
+            '''
+          }
+        }
+      }
+    }
   }
   
   post {
-    success {
-      echo """
-      🎉 =================================="
-      ✅ CUSTOM IMAGE PIPELINE SUCCESS!"
-      =================================="
-      
-      🎯 Custom Images Built & Deployed:"
-      • Frontend: Your Flask voting app (${COMMIT_ID})"
-      • Backend: Your Node.js results app (${COMMIT_ID})"
-      • Worker: Your .NET vote processor (${COMMIT_ID})"
-      
-      🚀 All images pushed to ECR and deployed to EKS!"
-      🌐 Namespace: ${NAMESPACE}"
-      
-      📱 Access your CUSTOM voting app:"
-      kubectl get svc -n voting-app"
-      
-      💡 Your code is now running in production!"
-      """
-    }
-    failure {
-      echo '❌ Custom image pipeline failed! Check logs.'
-    }
     always {
       container('jnlp') {
         sh '''
           # Cleanup Docker images to save space
           docker system prune -af || true
-          echo "🏁 Custom image pipeline finished."
         '''
       }
+    }
+    success {
+      echo '''
+        🎉 =================================="
+        ✅ CUSTOM IMAGE PIPELINE SUCCESS!"
+        =================================="
+        
+        🎯 Custom Images Built & Deployed:"
+        • Frontend: Your Flask voting app"
+        • Backend: Your Node.js results app"
+        • Worker: Your .NET vote processor"
+        
+        🚀 All images pushed to ECR and deployed to EKS!"
+        
+        📱 Access your CUSTOM voting app:"
+        kubectl get svc -n voting-app"
+        
+        💡 Your code is now running in production!"
+      '''
+    }
+    failure {
+      echo '❌ Custom image pipeline failed! Check logs.'
     }
   }
 }
