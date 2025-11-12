@@ -51,19 +51,20 @@ pipeline {
 
     stage('ECR Login') {
       steps {
-        container('jnlp') {
-          sh '''
-            echo "Logging into ECR..."
-            aws ecr get-login-password --region $AWS_REGION > /tmp/ecr-token
-            echo "ECR login token generated"
-          '''
-        }
-        container('dind') {
-          sh '''
-            echo "Docker login to ECR..."
-            cat /tmp/ecr-token | docker login --username AWS --password-stdin $ECR_REGISTRY
-            echo "ECR login successful"
-          '''
+        script {
+          container('jnlp') {
+            env.ECR_TOKEN = sh(
+              script: 'aws ecr get-login-password --region $AWS_REGION',
+              returnStdout: true
+            ).trim()
+          }
+          container('dind') {
+            sh '''
+              echo "Docker login to ECR..."
+              echo $ECR_TOKEN | docker login --username AWS --password-stdin $ECR_REGISTRY
+              echo "ECR login successful"
+            '''
+          }
         }
       }
     }
