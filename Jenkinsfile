@@ -1,283 +1,221 @@
 pipeline {
   agent {
     kubernetes {
-      yamlFile 'jenkins-dind-custom.yaml'
+      yamlFile 'jenkins-dind-final.yaml'
     }
   }
   
   environment {
     AWS_REGION = 'us-west-2'
     ECR_REGISTRY = '767225687948.dkr.ecr.us-west-2.amazonaws.com'
+    ECR_REPO_FRONTEND = 'voting-app-frontend'
+    ECR_REPO_BACKEND = 'voting-app-backend'
+    ECR_REPO_WORKER = 'voting-app-worker'
     EKS_CLUSTER = 'infra-env-cluster'
     NAMESPACE = 'voting-app'
-    COMMIT_ID = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
   }
   
   stages {
-    stage('🔍 Environment Setup') {
+    stage('Checkout') {
       steps {
-        container('jnlp') {
+        checkout scm
+      }
+    }
+    
+    stage('Wait for Docker Daemon') {
+      steps {
+        container('dind') {
           sh '''
-            echo "=== Custom Jenkins Agent with DinD ==="
-            echo "AWS Region: ${AWS_REGION}"
-            echo "ECR Registry: ${ECR_REGISTRY}"
-            echo "EKS Cluster: ${EKS_CLUSTER}"
-            echo "Commit ID: ${COMMIT_ID}"
-            echo "Namespace: ${NAMESPACE}"
-            echo ""
-            
-            echo "=== Tool Verification ==="
-            aws --version
-            kubectl version --client
-            git --version
-            echo "✅ All tools ready in custom image!"
+            echo "Waiting for Docker daemon to be ready..."
+            until docker info > /dev/null 2>&1; do
+              sleep 1
+            done
+            echo "Docker daemon is ready"
           '''
         }
       }
     }
     
-    stage('🐳 Wait for Docker Daemon') {
+    stage('Setup Tools') {
       steps {
-        container('jnlp') {
+        container('dind') {
           sh '''
-            echo "=== Waiting for Docker Daemon ==="
-            until docker info > /dev/null 2>&1; do
-              echo "Waiting for Docker daemon..."
-              sleep 2
-            done
-            echo "✅ Docker daemon is ready!"
+            # Install AWS CLI
+            apk add --no-cache aws-cli curl jq
+
+            # Install kubectl
+            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            mv kubectl /usr/local/bin/
+            
+            # Verify installations
+            aws --version
+            kubectl version --client
             docker --version
           '''
         }
       }
     }
     
-    stage('🔧 AWS & Kubernetes Setup') {
+    stage('AWS & EKS Setup') {
       steps {
-        container('jnlp') {
+        container('dind') {
           sh '''
-            echo "=== AWS Configuration ==="
+            # Configure AWS and EKS
             aws sts get-caller-identity
-            
-            echo "=== Kubernetes Configuration ==="
-            aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
+            aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
             kubectl get nodes
-            echo "✅ Cluster connection verified!"
           '''
         }
       }
     }
     
-    stage('🔐 ECR Login') {
+    stage('ECR Login') {
       steps {
-        container('jnlp') {
+        container('dind') {
           sh '''
-            echo "=== ECR Login ==="
-            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-            echo "✅ ECR login successful!"
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
           '''
         }
       }
     }
     
-    stage('📦 Build & Push Custom Images') {
-      parallel {
-        stage('🗳️ Frontend Service') {
-          steps {
-            container('jnlp') {
-              sh '''
-                echo "=== Building Frontend Image (Your Flask App) ==="
-                cd frontend
-                docker build -t ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} .
-                docker tag ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-frontend:latest
-                
-                docker push ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID}
-                docker push ${ECR_REGISTRY}/voting-app-frontend:latest
-                
-                echo "✅ Frontend image (your Flask app) pushed successfully!"
-              '''
-            }
-          }
-        }
-        
-        stage('📊 Backend Service') {
-          steps {
-            container('jnlp') {
-              sh '''
-                echo "=== Building Backend Image (Your Node.js App) ==="
-                cd backend
-                docker build -t ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} .
-                docker tag ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-backend:latest
-                
-                docker push ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID}
-                docker push ${ECR_REGISTRY}/voting-app-backend:latest
-                
-                echo "✅ Backend image (your Node.js app) pushed successfully!"
-              '''
-            }
-          }
-        }
-        
-        stage('⚙️ Worker Service') {
-          steps {
-            container('jnlp') {
-              sh '''
-                echo "=== Building Worker Image (Your .NET App) ==="
-                cd worker
-                docker build -t ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} .
-                docker tag ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-worker:latest
-                
-                docker push ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID}
-                docker push ${ECR_REGISTRY}/voting-app-worker:latest
-                
-                echo "✅ Worker image (your .NET app) pushed successfully!"
-              '''
-            }
+    stage('Build & Push Frontend') {
+      steps {
+        container('dind') {
+          dir('frontend') {
+            sh '''
+              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_FRONTEND:latest .
+              docker tag $ECR_REPO_FRONTEND:latest $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
+              docker push $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest
+            '''
           }
         }
       }
     }
     
-    stage('✅ Verify Custom Images') {
+    stage('Build & Push Backend') {
       steps {
-        container('jnlp') {
-          sh '''
-            echo "=== Verifying Custom Images in ECR ==="
-            
-            echo "Frontend images:"
-            aws ecr describe-images \\
-              --repository-name voting-app-frontend \\
-              --image-ids imageTag=${COMMIT_ID} \\
-              --region ${AWS_REGION} \\
-              --query 'imageDetails[0].imageTags'
-            
-            echo "Backend images:"
-            aws ecr describe-images \\
-              --repository-name voting-app-backend \\
-              --image-ids imageTag=${COMMIT_ID} \\
-              --region ${AWS_REGION} \\
-              --query 'imageDetails[0].imageTags'
-            
-            echo "Worker images:"
-            aws ecr describe-images \\
-              --repository-name voting-app-worker \\
-              --image-ids imageTag=${COMMIT_ID} \\
-              --region ${AWS_REGION} \\
-              --query 'imageDetails[0].imageTags'
-            
-            echo "✅ All custom images verified in ECR!"
-          '''
+        container('dind') {
+          dir('backend') {
+            sh '''
+              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_BACKEND:latest .
+              docker tag $ECR_REPO_BACKEND:latest $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
+              docker push $ECR_REGISTRY/$ECR_REPO_BACKEND:latest
+            '''
+          }
         }
       }
     }
     
-    stage('🚀 Deploy to EKS') {
+    stage('Build & Push Worker') {
       steps {
-        container('jnlp') {
+        container('dind') {
+          dir('worker') {
+            sh '''
+              DOCKER_BUILDKIT=1 docker build -t $ECR_REPO_WORKER:latest .
+              docker tag $ECR_REPO_WORKER:latest $ECR_REGISTRY/$ECR_REPO_WORKER:latest
+              docker push $ECR_REGISTRY/$ECR_REPO_WORKER:latest
+            '''
+          }
+        }
+      }
+    }
+    
+    stage('Deploy to EKS') {
+      steps {
+        container('dind') {
           sh '''
-            echo "=== Deploying Custom Images to EKS ==="
+            # Create namespace if it doesn't exist
+            kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
             
-            # Create namespace
-            kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
-            
-            # Deploy infrastructure first
+            # Apply infrastructure first (Redis, PostgreSQL)
             echo "Deploying infrastructure..."
-            kubectl apply -f k8s/redis.yaml -n ${NAMESPACE}
-            kubectl apply -f k8s/postgres.yaml -n ${NAMESPACE}
+            kubectl apply -f k8s/redis.yaml -n $NAMESPACE
+            kubectl apply -f k8s/postgres.yaml -n $NAMESPACE
             
-            # Wait for infrastructure
+            # Wait for infrastructure to be ready
             echo "Waiting for infrastructure..."
-            kubectl wait --for=condition=available --timeout=300s deployment/redis -n ${NAMESPACE} || true
-            kubectl wait --for=condition=available --timeout=300s deployment/db -n ${NAMESPACE} || true
+            kubectl wait --for=condition=available --timeout=300s deployment/redis -n $NAMESPACE || true
+            kubectl wait --for=condition=available --timeout=300s deployment/db -n $NAMESPACE || true
             
-            # Deploy applications
-            echo "Deploying applications with custom images..."
-            kubectl apply -f k8s/frontend.yaml -n ${NAMESPACE}
-            kubectl apply -f k8s/backend.yaml -n ${NAMESPACE}
-            kubectl apply -f k8s/worker.yaml -n ${NAMESPACE}
+            # Apply application deployments
+            echo "Deploying applications..."
+            kubectl apply -f k8s/frontend.yaml -n $NAMESPACE
+            kubectl apply -f k8s/backend.yaml -n $NAMESPACE
+            kubectl apply -f k8s/worker.yaml -n $NAMESPACE
             
-            # Update to use new custom images
-            echo "Updating to custom images with commit: ${COMMIT_ID}"
-            kubectl set image deployment/frontend \\
-              frontend=${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} \\
-              -n ${NAMESPACE}
+            # Force restart all deployments to pull latest images
+            echo "Forcing all deployments to pull latest images..."
+            kubectl rollout restart deployment/frontend -n $NAMESPACE
+            kubectl rollout restart deployment/backend -n $NAMESPACE
+            kubectl rollout restart deployment/worker -n $NAMESPACE
             
-            kubectl set image deployment/backend \\
-              backend=${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} \\
-              -n ${NAMESPACE}
+            # Wait for all rollouts to complete
+            echo "Waiting for rollouts to complete..."
+            kubectl rollout status deployment/frontend -n $NAMESPACE --timeout=300s
+            kubectl rollout status deployment/backend -n $NAMESPACE --timeout=300s
+            kubectl rollout status deployment/worker -n $NAMESPACE --timeout=300s
             
-            kubectl set image deployment/worker \\
-              worker=${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} \\
-              -n ${NAMESPACE}
+            echo "All deployments completed successfully!"
             
-            # Wait for rollout
-            echo "Waiting for custom image deployments..."
-            kubectl rollout status deployment/frontend -n ${NAMESPACE} --timeout=300s
-            kubectl rollout status deployment/backend -n ${NAMESPACE} --timeout=300s
-            kubectl rollout status deployment/worker -n ${NAMESPACE} --timeout=300s
-            
-            echo "=== Custom Image Deployment Complete ==="
-            kubectl get pods -n ${NAMESPACE}
-            kubectl get svc -n ${NAMESPACE}
-            
-            echo ""
-            echo "=== Your Custom Voting App URLs ==="
-            echo "Frontend URL:"
-            kubectl get svc frontend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "LoadBalancer pending..."
-            echo ""
-            echo "Backend URL:"
-            kubectl get svc backend -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "LoadBalancer pending..."
+            # Final deployment status check
+            echo "=== Final Deployment Status ==="
+            kubectl get pods -n $NAMESPACE
+            kubectl get svc -n $NAMESPACE
           '''
         }
       }
     }
     
-    stage('📊 Application Status') {
+    stage('Check Application Status') {
       steps {
-        container('jnlp') {
+        container('dind') {
           script {
             sh '''
               # Check deployment status
               echo "=== DEPLOYMENT STATUS ===" > app_status.txt
               
               # Frontend Status
-              FRONTEND_STATUS=$(kubectl get deployment frontend -n ${NAMESPACE} -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
-              FRONTEND_READY=$(kubectl get deployment frontend -n ${NAMESPACE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-              FRONTEND_DESIRED=$(kubectl get deployment frontend -n ${NAMESPACE} -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+              FRONTEND_STATUS=$(kubectl get deployment frontend -n $NAMESPACE -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
+              FRONTEND_READY=$(kubectl get deployment frontend -n $NAMESPACE -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+              FRONTEND_DESIRED=$(kubectl get deployment frontend -n $NAMESPACE -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
               
               echo "Frontend: $FRONTEND_STATUS ($FRONTEND_READY/$FRONTEND_DESIRED ready)" >> app_status.txt
               
               # Backend Status
-              BACKEND_STATUS=$(kubectl get deployment backend -n ${NAMESPACE} -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
-              BACKEND_READY=$(kubectl get deployment backend -n ${NAMESPACE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-              BACKEND_DESIRED=$(kubectl get deployment backend -n ${NAMESPACE} -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+              BACKEND_STATUS=$(kubectl get deployment backend -n $NAMESPACE -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
+              BACKEND_READY=$(kubectl get deployment backend -n $NAMESPACE -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+              BACKEND_DESIRED=$(kubectl get deployment backend -n $NAMESPACE -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
               
               echo "Backend: $BACKEND_STATUS ($BACKEND_READY/$BACKEND_DESIRED ready)" >> app_status.txt
               
               # Worker Status
-              WORKER_STATUS=$(kubectl get deployment worker -n ${NAMESPACE} -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
-              WORKER_READY=$(kubectl get deployment worker -n ${NAMESPACE} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-              WORKER_DESIRED=$(kubectl get deployment worker -n ${NAMESPACE} -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+              WORKER_STATUS=$(kubectl get deployment worker -n $NAMESPACE -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound")
+              WORKER_READY=$(kubectl get deployment worker -n $NAMESPACE -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+              WORKER_DESIRED=$(kubectl get deployment worker -n $NAMESPACE -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
               
               echo "Worker: $WORKER_STATUS ($WORKER_READY/$WORKER_DESIRED ready)" >> app_status.txt
               
               # Overall Status
               echo "" >> app_status.txt
               echo "=== PODS STATUS ===" >> app_status.txt
-              kubectl get pods -n ${NAMESPACE} --no-headers | awk '{print $1 ": " $3 " (" $2 ")"}' >> app_status.txt
+              kubectl get pods -n $NAMESPACE --no-headers | awk '{print $1 ": " $3 " (" $2 ")"}' >> app_status.txt
               
               # Service Status
               echo "" >> app_status.txt
               echo "=== SERVICES ===" >> app_status.txt
-              kubectl get svc -n ${NAMESPACE} --no-headers | awk '{print $1 ": " $2 " (" $4 ")"}' >> app_status.txt
+              kubectl get svc -n $NAMESPACE --no-headers | awk '{print $1 ": " $2 " (" $4 ")"}' >> app_status.txt
               
               # Overall health check
               if [ "$FRONTEND_STATUS" = "True" ] && [ "$BACKEND_STATUS" = "True" ] && [ "$WORKER_STATUS" = "True" ]; then
                 echo "" >> app_status.txt
                 echo "🟢 Overall Status: HEALTHY - All services running" >> app_status.txt
+                echo "HEALTHY" > overall_status.txt
               else
                 echo "" >> app_status.txt
-                echo "🟡 Overall Status: DEPLOYING - Some services starting" >> app_status.txt
+                echo "🔴 Overall Status: UNHEALTHY - Some services down" >> app_status.txt
+                echo "UNHEALTHY" > overall_status.txt
               fi
               
               # Display status
@@ -291,34 +229,34 @@ pipeline {
   
   post {
     always {
-      container('jnlp') {
+      container('dind') {
         sh '''
-          # Cleanup Docker images to save space
-          docker system prune -af || true
+          docker rmi $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest || true
+          docker rmi $ECR_REGISTRY/$ECR_REPO_BACKEND:latest || true
+          docker rmi $ECR_REGISTRY/$ECR_REPO_WORKER:latest || true
+          docker rmi $ECR_REPO_FRONTEND:latest || true
+          docker rmi $ECR_REPO_BACKEND:latest || true
+          docker rmi $ECR_REPO_WORKER:latest || true
         '''
       }
     }
     success {
       echo '''
         🎉 =================================="
-        ✅ CUSTOM IMAGE PIPELINE SUCCESS!"
+        ✅ PIPELINE COMPLETED SUCCESSFULLY!"
         =================================="
         
-        🎯 Custom Images Built & Deployed:"
-        • Frontend: Your Flask voting app"
-        • Backend: Your Node.js results app"
-        • Worker: Your .NET vote processor"
+        🎯 All custom images built and deployed!"
+        🌐 Namespace: voting-app"
         
-        🚀 All images pushed to ECR and deployed to EKS!"
+        📱 Access your application:"
+        - kubectl get svc -n voting-app"
         
-        📱 Access your CUSTOM voting app:"
-        kubectl get svc -n voting-app"
-        
-        💡 Your code is now running in production!"
+        🚀 Your voting app is now live!"
       '''
     }
     failure {
-      echo '❌ Custom image pipeline failed! Check logs.'
+      echo '❌ Pipeline failed! Check logs for details.'
     }
   }
 }
