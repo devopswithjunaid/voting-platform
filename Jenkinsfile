@@ -160,13 +160,19 @@ pipeline {
 
   post {
     always {
-      container('dind') {
-        sh '''
-          echo "Cleaning up Docker images..."
-          docker rmi $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest || true
-          docker rmi $ECR_REGISTRY/$ECR_REPO_BACKEND:latest || true
-          docker rmi $ECR_REGISTRY/$ECR_REPO_WORKER:latest || true
-        '''
+      script {
+        try {
+          container('dind') {
+            sh '''
+              echo "Cleaning up Docker images..."
+              docker rmi $ECR_REGISTRY/$ECR_REPO_FRONTEND:latest || true
+              docker rmi $ECR_REGISTRY/$ECR_REPO_BACKEND:latest || true
+              docker rmi $ECR_REGISTRY/$ECR_REPO_WORKER:latest || true
+            '''
+          }
+        } catch (Exception e) {
+          echo "Cleanup failed: ${e.getMessage()}"
+        }
       }
     }
     success { 
