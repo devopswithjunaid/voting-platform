@@ -7,41 +7,37 @@ pipeline {
     EKS_CLUSTER = 'infra-env-cluster'
     NAMESPACE = 'voting-app'
     COMMIT_ID = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-    
-    // Tool paths
-    KUBECTL_PATH = '/var/jenkins_home/kubectl'
-    AWS_PATH = '/var/jenkins_home/aws/dist/aws'
   }
   
   stages {
     stage('🔍 Environment Setup') {
       steps {
         sh '''
-          echo "=== Direct Execution Approach ==="
+          echo "=== Simple Direct Execution ==="
           echo "AWS Region: ${AWS_REGION}"
           echo "ECR Registry: ${ECR_REGISTRY}"
           echo "EKS Cluster: ${EKS_CLUSTER}"
           echo "Commit ID: ${COMMIT_ID}"
           echo "Namespace: ${NAMESPACE}"
           
-          # Check executor pod
-          ${KUBECTL_PATH} get deployment jenkins-executor -n jenkins
+          # Check executor pod without AWS CLI dependency
+          kubectl get deployment jenkins-executor -n jenkins --token=$(kubectl get secret -n jenkins $(kubectl get serviceaccount jenkins -n jenkins -o jsonpath='{.secrets[0].name}') -o jsonpath='{.data.token}' | base64 -d) 2>/dev/null || kubectl get deployment jenkins-executor -n jenkins
           echo "✅ Executor pod ready!"
         '''
       }
     }
     
-    stage('🔧 Setup Tools in Executor') {
+    stage('🔧 Setup Tools') {
       steps {
         sh '''
           echo "=== Installing Tools in Executor Pod ==="
           
           # Get executor pod name
-          EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+          EXECUTOR_POD=$(kubectl get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
           echo "Using executor pod: $EXECUTOR_POD"
           
           # Install tools
-          ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+          kubectl exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
             apk add --no-cache aws-cli curl jq git
             
             # Install kubectl
@@ -60,12 +56,12 @@ pipeline {
         sh '''
           echo "=== Copying Source Code ==="
           
-          EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+          EXECUTOR_POD=$(kubectl get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
           
           # Copy source code to executor pod
-          ${KUBECTL_PATH} cp . jenkins/$EXECUTOR_POD:/workspace/ -c tools
+          kubectl cp . jenkins/$EXECUTOR_POD:/workspace/ -c tools
           
-          ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+          kubectl exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
             cd /workspace
             ls -la
             echo 'Source code copied successfully!'
@@ -79,9 +75,9 @@ pipeline {
         sh '''
           echo "=== Setting up Docker & AWS ==="
           
-          EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+          EXECUTOR_POD=$(kubectl get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
           
-          ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+          kubectl exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
             # Wait for Docker daemon
             echo 'Waiting for Docker daemon...'
             for i in {1..60}; do
@@ -92,10 +88,8 @@ pipeline {
               sleep 2
             done
             
-            # Setup AWS and EKS
+            # Test AWS connection
             aws sts get-caller-identity
-            aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
-            kubectl get nodes
             
             echo 'Docker & AWS setup complete!'
           "
@@ -103,21 +97,21 @@ pipeline {
       }
     }
     
-    stage('🔐 ECR Login & Build Images') {
+    stage('🔐 Build Custom Images') {
       steps {
         sh '''
-          echo "=== ECR Login & Building Images ==="
+          echo "=== Building Custom Images ==="
           
-          EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+          EXECUTOR_POD=$(kubectl get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
           
-          ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+          kubectl exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
             cd /workspace
             
             # ECR Login
             aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
             
             # Build Frontend
-            echo 'Building Frontend...'
+            echo 'Building Frontend (Flask App)...'
             cd frontend
             docker build -t ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} .
             docker tag ${ECR_REGISTRY}/voting-app-frontend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-frontend:latest
@@ -125,7 +119,7 @@ pipeline {
             docker push ${ECR_REGISTRY}/voting-app-frontend:latest
             
             # Build Backend
-            echo 'Building Backend...'
+            echo 'Building Backend (Node.js App)...'
             cd ../backend
             docker build -t ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} .
             docker tag ${ECR_REGISTRY}/voting-app-backend:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-backend:latest
@@ -133,14 +127,14 @@ pipeline {
             docker push ${ECR_REGISTRY}/voting-app-backend:latest
             
             # Build Worker
-            echo 'Building Worker...'
+            echo 'Building Worker (.NET App)...'
             cd ../worker
             docker build -t ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} .
             docker tag ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID} ${ECR_REGISTRY}/voting-app-worker:latest
             docker push ${ECR_REGISTRY}/voting-app-worker:${COMMIT_ID}
             docker push ${ECR_REGISTRY}/voting-app-worker:latest
             
-            echo 'All images built and pushed successfully!'
+            echo 'All custom images built and pushed successfully!'
           "
         '''
       }
@@ -150,14 +144,14 @@ pipeline {
       steps {
         withCredentials([file(credentialsId: 'kubeconfig-credentials-id', variable: 'KUBECONFIG_FILE')]) {
           sh '''
-            echo "=== Deploying to EKS ==="
+            echo "=== Deploying Custom Images to EKS ==="
             
-            EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
+            EXECUTOR_POD=$(kubectl get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
             
             # Copy kubeconfig to executor pod
-            ${KUBECTL_PATH} cp $KUBECONFIG_FILE jenkins/$EXECUTOR_POD:/tmp/kubeconfig -c tools
+            kubectl cp $KUBECONFIG_FILE jenkins/$EXECUTOR_POD:/tmp/kubeconfig -c tools
             
-            ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+            kubectl exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
               cd /workspace
               
               # Setup kubeconfig
@@ -174,7 +168,7 @@ pipeline {
               kubectl apply -f k8s/postgres.yaml -n ${NAMESPACE}
               
               # Deploy applications
-              echo 'Deploying applications...'
+              echo 'Deploying applications with custom images...'
               kubectl apply -f k8s/frontend.yaml -n ${NAMESPACE}
               kubectl apply -f k8s/backend.yaml -n ${NAMESPACE}
               kubectl apply -f k8s/worker.yaml -n ${NAMESPACE}
@@ -189,26 +183,7 @@ pipeline {
               kubectl rollout status deployment/backend -n ${NAMESPACE} --timeout=300s
               kubectl rollout status deployment/worker -n ${NAMESPACE} --timeout=300s
               
-              echo 'Deployment complete!'
-              kubectl get pods -n ${NAMESPACE}
-              kubectl get svc -n ${NAMESPACE}
-            "
-          '''
-        }
-      }
-    }
-    
-    stage('✅ Verify Deployment') {
-      steps {
-        withCredentials([file(credentialsId: 'kubeconfig-credentials-id', variable: 'KUBECONFIG_FILE')]) {
-          sh '''
-            echo "=== Verifying Deployment ==="
-            
-            EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}')
-            
-            ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
-              # Check deployment status
-              kubectl get deployments -n ${NAMESPACE}
+              echo 'Custom image deployment complete!'
               kubectl get pods -n ${NAMESPACE}
               kubectl get svc -n ${NAMESPACE}
               
@@ -237,11 +212,16 @@ pipeline {
         echo "• Backend: Node.js results app (${COMMIT_ID})"
         echo "• Worker: .NET vote processor (${COMMIT_ID})"
         echo ""
-        echo "📱 Access Commands:"
-        echo "${KUBECTL_PATH} get svc -n voting-app"
-        echo "${KUBECTL_PATH} get pods -n voting-app"
+        echo "📱 Access your application:"
+        echo "kubectl get svc -n voting-app"
         echo ""
         echo "🚀 Your voting app is LIVE with custom images!"
+        echo ""
+        echo "💡 Complete CI/CD achieved:"
+        echo "- Custom Docker builds ✅"
+        echo "- ECR integration ✅"
+        echo "- EKS deployment ✅"
+        echo "- LoadBalancer services ✅"
       '''
     }
     failure {
@@ -250,9 +230,9 @@ pipeline {
     always {
       sh '''
         # Cleanup
-        EXECUTOR_POD=$(${KUBECTL_PATH} get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+        EXECUTOR_POD=$(kubectl get pods -n jenkins -l app=jenkins-executor -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
         if [ ! -z "$EXECUTOR_POD" ]; then
-          ${KUBECTL_PATH} exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
+          kubectl exec $EXECUTOR_POD -n jenkins -c tools -- sh -c "
             docker system prune -af || true
             rm -rf /workspace/* || true
           " 2>/dev/null || echo "Cleanup completed"
