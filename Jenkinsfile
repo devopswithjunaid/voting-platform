@@ -184,11 +184,23 @@ pipeline {
         }
       }
     }
-    success { 
-      echo 'Pipeline completed successfully!' 
+    success {
+      withCredentials([string(credentialsId: 'SLACK_WEBHOOK_URL', variable: 'SLACK_WEBHOOK_URL')]) {
+        sh '''
+        curl -X POST -H 'Content-type: application/json' \
+        --data '{"text": "✅ *Pipeline succeeded!*\\n*Job:* '$JOB_NAME'\\n*Build:* '$BUILD_NUMBER'\\n*URL:* '$BUILD_URL'"}' \
+        $SLACK_WEBHOOK_URL
+        '''
+      }
     }
-    failure { 
-      echo 'Pipeline failed. Check logs for details.' 
+    failure {
+      withCredentials([string(credentialsId: 'SLACK_WEBHOOK_URL', variable: 'SLACK_WEBHOOK_URL')]) {
+        sh '''
+        curl -X POST -H 'Content-type: application/json' \
+        --data '{"text": "❌ *Pipeline failed!*\\n*Job:* '$JOB_NAME'\\n*Build:* '$BUILD_NUMBER'\\n*URL:* '$BUILD_URL'"}' \
+        $SLACK_WEBHOOK_URL
+        '''
+      }
     }
   }
 }
