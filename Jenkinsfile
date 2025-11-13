@@ -165,6 +165,24 @@ pipeline {
         }
       }
     }
+
+    stage('Slack Notification') {
+      steps {
+        script {
+          try {
+            withCredentials([string(credentialsId: 'SLACK_WEBHOOK_URL', variable: 'SLACK_WEBHOOK_URL')]) {
+              sh '''
+              curl -X POST -H 'Content-type: application/json' \
+              --data '{"text": "✅ *Pipeline succeeded!*\\n*Job:* '$JOB_NAME'\\n*Build:* '$BUILD_NUMBER'\\n*URL:* '$BUILD_URL'"}' \
+              $SLACK_WEBHOOK_URL
+              '''
+            }
+          } catch (Exception e) {
+            echo "Slack notification failed: ${e.getMessage()}"
+          }
+        }
+      }
+    }
   }
 
   post {
@@ -182,15 +200,6 @@ pipeline {
         } catch (Exception e) {
           echo "Cleanup failed: ${e.getMessage()}"
         }
-      }
-    }
-    success {
-      withCredentials([string(credentialsId: 'SLACK_WEBHOOK_URL', variable: 'SLACK_WEBHOOK_URL')]) {
-        sh '''
-        curl -X POST -H 'Content-type: application/json' \
-        --data '{"text": "✅ *Pipeline succeeded!*\\n*Job:* '$JOB_NAME'\\n*Build:* '$BUILD_NUMBER'\\n*URL:* '$BUILD_URL'"}' \
-        $SLACK_WEBHOOK_URL
-        '''
       }
     }
     failure {
